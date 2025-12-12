@@ -96,7 +96,7 @@ install(TARGETS cloudini_topic_converter_component
   LIBRARY DESTINATION lib
 )
 
-install(TARGETS cloudini_topic_converter
+install(TARGETS cloudini_topic_converter cloudini_topic_converter_multi
   RUNTIME DESTINATION lib/cloudini_ros
 )
 
