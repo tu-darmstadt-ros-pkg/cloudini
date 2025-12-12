@@ -4,6 +4,9 @@
 
 ![Cloudini](logo.png)
 
+## Changelog
+- 12.12.2025 Add a topic_converter_multi node that handles multiple sub/pub pairs.
+
 **Cloudini** (pronounced with Italian accent) is a pointcloud compression
 library.
 
