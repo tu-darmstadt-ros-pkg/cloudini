@@ -62,9 +62,16 @@ find_package(rclcpp_components REQUIRED)
 add_library(cloudini_topic_converter_component SHARED
   src/topic_converter.cpp
 )
+add_executable(cloudini_topic_converter_multi
+  src/topic_converter_multi.cpp
+)
 
 target_include_directories(cloudini_topic_converter_component
   PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_include_directories(cloudini_topic_converter_multi
+  PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
@@ -72,6 +79,10 @@ target_link_libraries(cloudini_topic_converter_component
   cloudini_ros
   cloudini_lib::cloudini_lib
   rclcpp_components::component
+)
+target_link_libraries(cloudini_topic_converter_multi
+  cloudini_ros
+  cloudini_lib::cloudini_lib
 )
 
 rclcpp_components_register_node(
