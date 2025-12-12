@@ -60,7 +60,7 @@ class CloudiniPointcloudConverterMulti : public rclcpp::Node {
   std::vector<rclcpp::SerializedMessage> output_messages_;
 
   bool compressing_ = true;
-  double resolution_ = 0.001;  // 1mm
+  std::vector<double> resolutions_;  // per-topic resolution values
 
   // Per-topic statistics
   std::vector<uint64_t> tot_original_sizes_;
@@ -110,11 +110,10 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
   this->declare_parameter<bool>("compressing", true);
   this->declare_parameter<std::vector<std::string>>("topics_input", std::vector<std::string>{});
   this->declare_parameter<std::vector<std::string>>("topics_output", std::vector<std::string>{});
-  this->declare_parameter<double>("resolution", 0.001);
+  this->declare_parameter<std::vector<double>>("resolution", std::vector<double>{});
 
   // read parameters
   compressing_ = this->get_parameter("compressing").as_bool();
-  resolution_ = this->get_parameter("resolution").as_double();
 
   const std::vector<std::string> input_topics = this->get_parameter("topics_input").as_string_array();
   if (input_topics.empty()) {
@@ -123,6 +122,7 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
   }
 
   std::vector<std::string> output_topics = this->get_parameter("topics_output").as_string_array();
+  std::vector<double> resolution_params = this->get_parameter("resolution").as_double_array();
 
   // If output topics not provided, generate them
   if (output_topics.empty()) {
@@ -149,8 +149,28 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
   const std::string input_topic_type = compressing_ ? pointcloud_topic_type : compressed_topic_type;
   const std::string output_topic_type = compressing_ ? compressed_topic_type : pointcloud_topic_type;
 
-  // Reserve space for vectors
+  // Handle resolution parameter
   const size_t num_topics = input_topics.size();
+  if (resolution_params.empty()) {
+    // Case 1: Not specified, use default for all topics
+    resolutions_.resize(num_topics, 0.001);
+    RCLCPP_INFO(this->get_logger(), "Using default resolution 0.001 for all %zu topics", num_topics);
+  } else if (resolution_params.size() == 1) {
+    // Case 2: One value specified, use for all topics
+    resolutions_.resize(num_topics, resolution_params[0]);
+    RCLCPP_INFO(this->get_logger(), "Using resolution %.6f for all %zu topics", resolution_params[0], num_topics);
+  } else if (resolution_params.size() == num_topics) {
+    // Case 3: Multiple values, must match number of topics
+    resolutions_ = resolution_params;
+    RCLCPP_INFO(this->get_logger(), "Using per-topic resolution values for %zu topics", num_topics);
+  } else {
+    RCLCPP_ERROR(
+        this->get_logger(), "Resolution parameter size (%zu) must be 0, 1, or match topics size (%zu)",
+        resolution_params.size(), num_topics);
+    throw std::runtime_error("Resolution parameter size mismatch");
+  }
+
+  // Reserve space for vectors
   point_cloud_subscribers_.reserve(num_topics);
   point_cloud_publishers_.reserve(num_topics);
   output_raw_messages_.resize(num_topics);
@@ -173,8 +193,8 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
         std::bind(&CloudiniPointcloudConverterMulti::callback, this, i, std::placeholders::_1);
 
     RCLCPP_INFO(
-        this->get_logger(), "[%zu] Subscribing to topic '%s' of type '%s'", i, input_topic.c_str(),
-        input_topic_type.c_str());
+        this->get_logger(), "[%zu] Subscribing to topic '%s' of type '%s' (resolution: %.6f)", i, input_topic.c_str(),
+        input_topic_type.c_str(), resolutions_[i]);
 
     // Create a generic subscriber for point cloud messages
     auto subscriber = this->create_generic_subscription(
@@ -211,7 +231,7 @@ void CloudiniPointcloudConverterMulti::callback(size_t topic_index, std::shared_
 
   if (compressing_) {
     const auto encoding_info = cloudini_ros::toEncodingInfo(pc_info);
-    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, pc_info.fields, resolution_);
+    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, pc_info.fields, resolutions_[topic_index]);
     cloudini_ros::convertPointCloud2ToCompressedCloud(pc_info, encoding_info, output_raw_messages_[topic_index]);
   } else {
     cloudini_ros::convertCompressedCloudToPointCloud2(pc_info, output_raw_messages_[topic_index]);
