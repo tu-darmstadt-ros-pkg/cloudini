@@ -44,6 +44,15 @@ ros2 run cloudini_ros cloudini_topic_converter --ros-args \
     -p topic_output:=/points/decompressed
 ```
 
+#### cloudini_topic_converter_multi
+This one works just like `cloudini_topic_converter` but handles multiple topics.
+```
+ros2 run cloudini_ros cloudini_topic_converter_multi --ros-args \
+    -p topics_input:=[/points1,/points2]  \
+    -p topic_output:=[/points1/compressed,/points2/compressed]
+```
+The parameter `topics_output` is optional, it defaults to the suffix `/compressed`.
+
 ## cloudini_rosbag_converter
 
 A command line tool that, given a rosbag (limited to MCAP format), converts

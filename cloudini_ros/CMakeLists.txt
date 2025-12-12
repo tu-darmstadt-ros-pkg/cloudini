@@ -59,10 +59,17 @@ install(
 ######### topic converter #########
 
 add_executable(cloudini_topic_converter
-  src/topic_converter.cpp
+  src/topic_converter.cpp  
+)
+add_executable(cloudini_topic_converter_multi
+  src/topic_converter_multi.cpp
 )
 
 target_include_directories(cloudini_topic_converter
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_include_directories(cloudini_topic_converter_multi
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
@@ -71,8 +78,12 @@ target_link_libraries(cloudini_topic_converter
   cloudini_ros
   cloudini_lib::cloudini_lib
 )
+target_link_libraries(cloudini_topic_converter_multi
+  cloudini_ros
+  cloudini_lib::cloudini_lib
+)
 
-install(TARGETS cloudini_topic_converter
+install(TARGETS cloudini_topic_converter cloudini_topic_converter_multi
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/cloudini_ros
