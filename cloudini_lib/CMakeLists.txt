@@ -25,20 +25,18 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(ament_cmake QUIET)
 if(ament_cmake_FOUND)
   message(STATUS "Found ament_cmake")
-  set(CLOUDINI_FORCE_VENDORED_DEPS OFF FORCE)
+  set(CLOUDINI_FORCE_VENDORED_DEPS OFF)
 endif()
 
 include(FetchContent)
 include(cmake/CPM.cmake)
 
 include(cmake/find_or_download_zstd.cmake)
-find_or_download_zstd(CLOUDINI_FORCE_VENDORED_DEPS)
+find_or_download_zstd(${CLOUDINI_FORCE_VENDORED_DEPS})
 
 include(cmake/find_or_download_lz4.cmake)
-find_or_download_lz4(CLOUDINI_FORCE_VENDORED_DEPS)
+find_or_download_lz4(${CLOUDINI_FORCE_VENDORED_DEPS})
 
-include(cmake/find_or_download_mcap.cmake)
-find_or_download_mcap()
 
 ##################################################################################
 
@@ -105,10 +103,18 @@ target_include_directories(cloudini_lib
     $<INSTALL_INTERFACE:include>
 )
 
+# In ament/ROS builds cloudini_lib is a shared library. System libzstd.a is not
+# compiled with -fPIC and cannot be embedded in a .so; use the shared variant.
+if(ament_cmake_FOUND AND TARGET zstd::libzstd_shared)
+  set(CLOUDINI_ZSTD_TARGET zstd::libzstd_shared)
+else()
+  set(CLOUDINI_ZSTD_TARGET zstd::libzstd_static)
+endif()
+
 target_link_libraries(cloudini_lib
   PRIVATE
     $<BUILD_INTERFACE:LZ4::lz4_static>
-    $<BUILD_INTERFACE:zstd::libzstd_static>
+    $<BUILD_INTERFACE:${CLOUDINI_ZSTD_TARGET}>
   PUBLIC
     ${PCL_COMMON_LIBRARIES}
     ${PCL_IO_LIBRARIES}
@@ -174,10 +180,12 @@ else()
   )
 endif(NOT EMSCRIPTEN)
 
-if(CLOUDINI_BUILD_TOOLS)
+if(CLOUDINI_BUILD_TOOLS AND NOT ament_cmake_FOUND)
   if(EMSCRIPTEN)
     message(STATUS "Disabling tools build for Emscripten")
   else()
+    include(cmake/find_or_download_mcap.cmake)
+    find_or_download_mcap()
     add_subdirectory(tools)
   endif()
 endif()

@@ -17,7 +17,6 @@ find_package(pcl_conversions REQUIRED)
 
 set(PLUGIN_DEPS
   pluginlib::pluginlib
-  rosbag2_cpp::rosbag2_cpp
   point_cloud_transport::point_cloud_transport
   rclcpp::rclcpp
   cloudini_lib::cloudini_lib
@@ -109,6 +108,7 @@ add_executable(rosbag_benchmark
 
 target_link_libraries(rosbag_benchmark
   cloudini_ros
+  rosbag2_cpp::rosbag2_cpp
 )
 
 if(Draco_FOUND)
@@ -144,8 +144,11 @@ target_link_libraries(test_plugin_subscriber
   ${PCL_COMMON_LIBRARIES}
   ${point_cloud_interfaces_TARGETS}
   point_cloud_transport::point_cloud_transport
+  ${pcl_conversions_TARGETS}
 )
 
+# pcl_conversions: older distros (Humble/Jazzy) export INCLUDE_DIRS; newer ones (Kilted/Rolling)
+# export cmake targets only. Use both so it works everywhere.
 target_include_directories(test_plugin_subscriber
   PRIVATE
     ${pcl_conversions_INCLUDE_DIRS}
@@ -221,7 +224,6 @@ pluginlib_export_plugin_description_file(point_cloud_transport cloudini_plugins.
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   pluginlib
-  rosbag2_cpp
   point_cloud_transport
   rclcpp
   rclcpp_components

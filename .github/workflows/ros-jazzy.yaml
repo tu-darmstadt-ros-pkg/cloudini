@@ -7,6 +7,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,4 +28,10 @@ jobs:
             cloudini_ros
           target-ros2-distro: jazzy
           colcon-defaults: |
-            {"build": {"merge-install": true}, "test": {"merge-install": true}}
+            {
+              "build": {
+                "merge-install": true,
+                "cmake-args": ["-DFETCHCONTENT_FULLY_DISCONNECTED=ON"]
+              },
+              "test": {"merge-install": true}
+            }

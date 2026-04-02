@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>cloudini_lib</name>
-  <version>1.0.0</version>
+  <version>1.0.3</version>
   <description>
   Main library of Cloudini, the pointcloud compression library
   </description>
@@ -20,7 +20,6 @@
   <exec_depend>libpcl-io</exec_depend>
   <build_depend>libzstd-dev</build_depend>
   <build_depend>lz4</build_depend>
-  <build_depend>mcap_vendor</build_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

@@ -7,6 +7,10 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,3 +27,9 @@ jobs:
             cloudini_lib
             cloudini_ros
           target-ros2-distro: humble
+          colcon-defaults: |
+            {
+              "build": {
+                "cmake-args": ["-DFETCHCONTENT_FULLY_DISCONNECTED=ON"]
+              }
+            }
