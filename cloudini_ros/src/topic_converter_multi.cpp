@@ -19,6 +19,7 @@
 #include <rclcpp/generic_publisher.hpp>
 #include <rclcpp/generic_subscription.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_components/register_node_macro.hpp>
 #include <rosidl_typesupport_cpp/message_type_support.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
@@ -105,7 +106,7 @@ rclcpp::QoS adapt_request_to_offers(
 //-----------------------------------------------------
 
 CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp::NodeOptions& options)
-    : rclcpp::Node("cloudini_pointcloud_converter_multi", options) {
+    : rclcpp::Node("cloudini_pointcloud_converter_multi", rclcpp::NodeOptions(options).use_intra_process_comms(true)) {
   // Declare parameters for input and output topics
   this->declare_parameter<bool>("compressing", true);
   this->declare_parameter<std::vector<std::string>>("topics_input", std::vector<std::string>{});
@@ -250,20 +251,11 @@ void CloudiniPointcloudConverterMulti::callback(size_t topic_index, std::shared_
     double average_ratio = static_cast<double>(tot_compressed_sizes_[topic_index]) / tot_original_sizes_[topic_index];
     tot_compressed_sizes_[topic_index] = 0;
     tot_original_sizes_[topic_index] = 0;
-    RCLCPP_INFO(
+    RCLCPP_DEBUG(
         this->get_logger(), "[%zu] Converted %d messages, average compression ratio: %.2f", topic_index, count,
         average_ratio);
   }
   count++;
 }
 
-int main(int argc, char** argv) {
-  // Initialize ROS2 node
-  rclcpp::init(argc, argv);
-  rclcpp::NodeOptions options;
-  options.use_intra_process_comms(true);
-  auto node = std::make_shared<CloudiniPointcloudConverterMulti>(options);
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(CloudiniPointcloudConverterMulti)

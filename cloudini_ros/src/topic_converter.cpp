@@ -186,7 +186,7 @@ void CloudiniPointcloudConverter::callback(std::shared_ptr<rclcpp::SerializedMes
     double average_ratio = static_cast<double>(tot_compressed_size) / tot_original_size;
     tot_compressed_size = 0;
     tot_original_size = 0;
-    RCLCPP_INFO(this->get_logger(), "Converted %d messages, average compression ratio: %.2f", count, average_ratio);
+    RCLCPP_DEBUG(this->get_logger(), "Converted %d messages, average compression ratio: %.2f", count, average_ratio);
   }
   count++;
 }
