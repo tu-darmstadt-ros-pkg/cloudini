@@ -61,7 +61,7 @@ find_package(rclcpp_components REQUIRED)
 add_library(cloudini_topic_converter_component SHARED
   src/topic_converter.cpp
 )
-add_executable(cloudini_topic_converter_multi
+add_library(cloudini_topic_converter_multi_component SHARED
   src/topic_converter_multi.cpp
 )
 
@@ -69,8 +69,8 @@ target_include_directories(cloudini_topic_converter_component
   PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_include_directories(cloudini_topic_converter_multi
-  PUBLIC
+target_include_directories(cloudini_topic_converter_multi_component
+  PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
 
@@ -79,9 +79,10 @@ target_link_libraries(cloudini_topic_converter_component
   cloudini_lib::cloudini_lib
   rclcpp_components::component
 )
-target_link_libraries(cloudini_topic_converter_multi
+target_link_libraries(cloudini_topic_converter_multi_component
   cloudini_ros
   cloudini_lib::cloudini_lib
+  rclcpp_components::component
 )
 
 rclcpp_components_register_node(
@@ -90,7 +91,19 @@ rclcpp_components_register_node(
   EXECUTABLE cloudini_topic_converter
 )
 
+rclcpp_components_register_node(
+  cloudini_topic_converter_multi_component
+  PLUGIN "CloudiniPointcloudConverterMulti"
+  EXECUTABLE cloudini_topic_converter_multi
+)
+
 install(TARGETS cloudini_topic_converter_component
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+)
+
+install(TARGETS cloudini_topic_converter_multi_component
   EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
