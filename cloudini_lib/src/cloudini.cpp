@@ -17,10 +17,13 @@
 #include "cloudini_lib/cloudini.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <limits>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 
 #include "chunk_writer.hpp"
 #include "codec_common.hpp"
@@ -164,6 +167,9 @@ CompressionOption CompressionOptionFromString(std::string_view str) {
 
 std::string EncodingInfoToYAML(const EncodingInfo& info) {
   std::ostringstream yaml;
+  // Force '.' as the decimal separator regardless of the process's global C++ locale, so the
+  // wire format stays canonical (the reader parses with std::from_chars, which only accepts '.').
+  yaml.imbue(std::locale::classic());
   yaml << "version: " << static_cast<int>(info.version) << "\n";
   yaml << "width: " << info.width << "\n";
   yaml << "height: " << info.height << "\n";
@@ -220,7 +226,14 @@ EncodingInfo EncodingInfoFromYAML(std::string_view yaml) {
 
       std::string res_str = field_node["resolution"].as<std::string>();
       if (res_str != "null") {
-        field.resolution = std::stof(res_str);
+        // std::from_chars is locale-independent (always '.'). std::stof/strtof would honor the
+        // C locale LC_NUMERIC, which Qt apps (rviz) set to the system locale on startup; under a
+        // comma-decimal locale that misparses "0.001" as 0.0 and crashes the lossy float decoder.
+        float res = 0.0f;
+        const auto [ptr, ec] = std::from_chars(res_str.data(), res_str.data() + res_str.size(), res);
+        if (ec == std::errc{} && res > 0.0f) {  // res > 0 mirrors the binary header path below
+          field.resolution = res;
+        }
       }
       info.fields.push_back(field);
     }

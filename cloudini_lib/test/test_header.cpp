@@ -16,13 +16,45 @@
 
 #include <gtest/gtest.h>
 
+#include <clocale>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "cloudini_lib/cloudini.hpp"
 
 namespace {
+
+// RAII guard that temporarily sets the C LC_NUMERIC locale (the one std::stof/strtof honor)
+// to the first available candidate, restoring the previous locale on destruction. Used to
+// reproduce the rviz/Qt environment, where Qt sets a comma-decimal LC_NUMERIC at startup.
+class ScopedCNumericLocale {
+ public:
+  explicit ScopedCNumericLocale(std::initializer_list<const char*> candidates) {
+    const char* current = std::setlocale(LC_NUMERIC, nullptr);
+    saved_ = current ? current : "C";
+    for (const char* name : candidates) {
+      if (std::setlocale(LC_NUMERIC, name) != nullptr) {
+        applied_ = true;
+        break;
+      }
+    }
+  }
+  ~ScopedCNumericLocale() {
+    std::setlocale(LC_NUMERIC, saved_.c_str());
+  }
+  ScopedCNumericLocale(const ScopedCNumericLocale&) = delete;
+  ScopedCNumericLocale& operator=(const ScopedCNumericLocale&) = delete;
+
+  bool applied() const {
+    return applied_;
+  }
+
+ private:
+  std::string saved_;
+  bool applied_ = false;
+};
 
 struct VersionPoint {
   float x = 0.0F;
@@ -259,4 +291,65 @@ TEST(Cloudini, HeaderMissingYamlTerminator) {
 
   ConstBufferView input(buffer.data(), buffer.size());
   EXPECT_THROW(DecodeHeader(input), std::runtime_error);
+}
+
+// Regression for the rviz crash "FieldDecoderFloatN_Lossy requires a resolution with value > 0.0".
+// Inside a Qt app (rviz), LC_NUMERIC is set to the system locale; under a comma-decimal locale the
+// old std::stof("0.001") returned 0.0, which made the lossy float decoder throw. The decoder now
+// uses std::from_chars (locale-independent), so the round-trip must succeed regardless of locale.
+TEST(Cloudini, HeaderResolutionParsedUnderCommaLocale) {
+  using namespace Cloudini;
+
+  ScopedCNumericLocale locale_guard(
+      {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "fr_FR.UTF-8", "fr_FR.utf8", "nl_NL.UTF-8"});
+  if (!locale_guard.applied()) {
+    GTEST_SKIP() << "No comma-decimal C locale installed to reproduce the bug";
+  }
+
+  const size_t kPoints = 512;
+  const std::vector<VersionPoint> points = makeVersionedPoints(kPoints);
+  const EncodingInfo info = makeVersionedLossyInfo(kPoints);
+
+  std::vector<uint8_t> encoded;
+  ASSERT_NO_THROW({ encoded = encodeVersionedPoints(info, points); });
+
+  // Pre-fix this throws while building FieldDecoderFloatN_Lossy from a misparsed 0.0 resolution.
+  ConstBufferView header_view(encoded.data(), encoded.size());
+  EncodingInfo decoded_info;
+  ASSERT_NO_THROW({ decoded_info = DecodeHeader(header_view); });
+  for (const auto& field : decoded_info.fields) {
+    if (field.type == FieldType::FLOAT32) {
+      ASSERT_TRUE(field.resolution.has_value()) << field.name;
+      EXPECT_NEAR(field.resolution.value(), 0.001F, 1e-9F) << field.name;
+    }
+  }
+
+  expectVersionedRoundTrip(info, points, encoded);
+}
+
+// Portable (locale-installation-independent) check: the writer always emits '.' decimals and the
+// reader recovers them. Exercises the imbue(classic) on EncodingInfoToYAML / parseScalar.
+TEST(Cloudini, HeaderYamlUsesDotDecimalSeparator) {
+  using namespace Cloudini;
+
+  EncodingInfo info;
+  info.width = 1;
+  info.height = 1;
+  info.point_step = sizeof(float) * 3;
+  info.encoding_opt = EncodingOptions::LOSSY;
+  info.compression_opt = CompressionOption::ZSTD;
+  info.fields.push_back({"x", 0, FieldType::FLOAT32, 0.001F});
+  info.fields.push_back({"y", 4, FieldType::FLOAT32, 0.001F});
+  info.fields.push_back({"z", 8, FieldType::FLOAT32, 0.001F});
+
+  const std::string yaml = EncodingInfoToYAML(info);
+  EXPECT_NE(yaml.find("0.001"), std::string::npos) << yaml;
+  EXPECT_EQ(yaml.find("0,001"), std::string::npos) << yaml;
+
+  const EncodingInfo parsed = EncodingInfoFromYAML(yaml);
+  ASSERT_EQ(parsed.fields.size(), 3u);
+  for (const auto& field : parsed.fields) {
+    ASSERT_TRUE(field.resolution.has_value()) << field.name;
+    EXPECT_NEAR(field.resolution.value(), 0.001F, 1e-9F) << field.name;
+  }
 }
