@@ -36,7 +36,10 @@ EncodingInfo ConvertToEncodingInfo(const sensor_msgs::msg::PointCloud2& msg, flo
     field.name = msg_field.name;
     field.offset = msg_field.offset;
     field.type = static_cast<FieldType>(msg_field.datatype);
-    field.resolution = (field.type == FieldType::FLOAT32) ? std::optional<float>(resolution) : std::nullopt;
+    // Packed color fields are excluded: their bits are an integer, not a real value.
+    field.resolution = (field.type == FieldType::FLOAT32 && !isPackedColorField(field))  //
+                           ? std::optional<float>(resolution)
+                           : std::nullopt;
     info.fields.push_back(field);
   }
   return info;

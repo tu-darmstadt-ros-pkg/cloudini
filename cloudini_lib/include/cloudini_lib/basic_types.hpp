@@ -66,6 +66,17 @@ struct PointField {
   }
 };
 
+/**
+ * @brief True if the field holds a color packed into the bit pattern of a FLOAT32.
+ *
+ * ROS and PCL store colors in a FLOAT32 field named "rgb" (or "rgba") whose bits are a packed
+ * 0x00RRGGBB / 0xAARRGGBB integer rather than a real number. Quantizing such a field with a
+ * resolution collapses it to zero, so it must never be assigned one.
+ */
+inline bool isPackedColorField(const PointField& field) {
+  return field.type == FieldType::FLOAT32 && (field.name == "rgb" || field.name == "rgba");
+}
+
 // If the value of PointField::offset is equal to this one, it means that the field was encoded, but we don't want to
 // save it when doing the decoding
 constexpr static uint32_t kDecodeButSkipStore = std::numeric_limits<uint32_t>::max();

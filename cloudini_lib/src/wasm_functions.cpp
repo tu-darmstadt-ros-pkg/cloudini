@@ -62,11 +62,7 @@ uint32_t cldn_ComputeCompressedSize(uintptr_t dds_msg_ptr, uint32_t dds_msg_size
 
     Cloudini::EncodingInfo encoding_info = cloudini_ros::toEncodingInfo(pc_info);
 
-    for (auto& field : encoding_info.fields) {
-      if (field.type == Cloudini::FieldType::FLOAT32) {
-        field.resolution = resolution;
-      }
-    }
+    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, encoding_info.fields, resolution);
 
     // Don't use static - it causes memory leaks in WASM
     std::vector<uint8_t> compressed_cloud;
@@ -176,11 +172,7 @@ uint32_t cldn_EncodePointcloudMessage(
 
     Cloudini::EncodingInfo encoding_info = cloudini_ros::toEncodingInfo(pc_info);
 
-    for (auto& field : encoding_info.fields) {
-      if (field.type == Cloudini::FieldType::FLOAT32) {
-        field.resolution = resolution;
-      }
-    }
+    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, encoding_info.fields, resolution);
 
     // Verify data size matches expected size
     const size_t expected_size = pc_info.width * pc_info.height * pc_info.point_step;

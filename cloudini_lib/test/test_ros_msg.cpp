@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <fstream>
 #include <iostream>
 
@@ -141,6 +142,88 @@ TEST(Cloudini, DDS_Roundtrip) {
   const std::vector<uint8_t> original_data(pc_info.data.data(), pc_info.data.data() + pc_info.data.size());
 
   VerifyRoundTrip(encoding_info, original_data, resolution);
+}
+
+// Layout of a pcl::PointXYZRGB serialized as sensor_msgs/PointCloud2:
+// x,y,z are real-valued FLOAT32, "rgb" is a FLOAT32 whose *bit pattern* is a
+// packed 0x00RRGGBB integer.
+struct PointXYZRGB_Layout {
+  float x;
+  float y;
+  float z;
+  float padding;
+  float rgb;
+  float padding2[3];
+};
+
+static float packRGB(uint8_t r, uint8_t g, uint8_t b) {
+  const uint32_t packed = (static_cast<uint32_t>(r) << 16) | (static_cast<uint32_t>(g) << 8) | b;
+  float as_float = 0.0F;
+  std::memcpy(&as_float, &packed, sizeof(packed));
+  return as_float;
+}
+
+static uint32_t unpackRGB(float value) {
+  uint32_t packed = 0;
+  std::memcpy(&packed, &value, sizeof(packed));
+  return packed & 0x00FFFFFFU;
+}
+
+TEST(Cloudini, PackedColorFieldSurvivesLossyRoundtrip) {
+  constexpr float kResolution = 0.001F;
+  constexpr size_t kPointCount = 64;
+
+  std::vector<Cloudini::PointField> fields = {
+      {"x", offsetof(PointXYZRGB_Layout, x), FieldType::FLOAT32, std::nullopt},
+      {"y", offsetof(PointXYZRGB_Layout, y), FieldType::FLOAT32, std::nullopt},
+      {"z", offsetof(PointXYZRGB_Layout, z), FieldType::FLOAT32, std::nullopt},
+      {"rgb", offsetof(PointXYZRGB_Layout, rgb), FieldType::FLOAT32, std::nullopt},
+  };
+  cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, fields, kResolution);
+
+  // The packed color field must not be assigned a quantization resolution.
+  ASSERT_TRUE(fields[0].resolution.has_value());
+  ASSERT_FALSE(fields[3].resolution.has_value());
+
+  EncodingInfo info;
+  info.fields = fields;
+  info.width = kPointCount;
+  info.height = 1;
+  info.point_step = sizeof(PointXYZRGB_Layout);
+  info.encoding_opt = EncodingOptions::LOSSY;
+  info.compression_opt = CompressionOption::ZSTD;
+
+  std::vector<PointXYZRGB_Layout> points(kPointCount, PointXYZRGB_Layout{});
+  for (size_t i = 0; i < kPointCount; ++i) {
+    points[i].x = 0.01F * static_cast<float>(i);
+    points[i].y = 0.02F * static_cast<float>(i);
+    points[i].z = 0.03F * static_cast<float>(i);
+    points[i].rgb = packRGB(static_cast<uint8_t>(i * 3), static_cast<uint8_t>(255 - i), static_cast<uint8_t>(i ^ 0x5A));
+  }
+
+  const std::vector<uint8_t> original_data(
+      reinterpret_cast<const uint8_t*>(points.data()),
+      reinterpret_cast<const uint8_t*>(points.data()) + points.size() * sizeof(PointXYZRGB_Layout));
+
+  PointcloudEncoder pc_encoder(info);
+  std::vector<uint8_t> compressed_data;
+  pc_encoder.encode(original_data, compressed_data);
+
+  PointcloudDecoder pc_decoder;
+  std::vector<uint8_t> decoded_data;
+  ConstBufferView compressed_view(compressed_data.data(), compressed_data.size());
+  auto recovered_header = DecodeHeader(compressed_view);
+  pc_decoder.decode(recovered_header, compressed_view, decoded_data);
+
+  ASSERT_EQ(decoded_data.size(), original_data.size());
+  const auto* decoded = reinterpret_cast<const PointXYZRGB_Layout*>(decoded_data.data());
+
+  for (size_t i = 0; i < kPointCount; ++i) {
+    EXPECT_NEAR(points[i].x, decoded[i].x, kResolution) << "Point index: " << i;
+    EXPECT_NEAR(points[i].y, decoded[i].y, kResolution) << "Point index: " << i;
+    EXPECT_NEAR(points[i].z, decoded[i].z, kResolution) << "Point index: " << i;
+    EXPECT_EQ(unpackRGB(points[i].rgb), unpackRGB(decoded[i].rgb)) << "Point index: " << i;
+  }
 }
 
 TEST(Cloudini, RosPointCloud2CopyRebindsOwnedDataView) {

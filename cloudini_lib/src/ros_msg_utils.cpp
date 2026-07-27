@@ -231,7 +231,8 @@ void applyResolutionProfile(
     auto profile_it = profile.find(field.name);
     if (profile_it != profile.end()) {
       field.resolution = profile_it->second;
-    } else if (default_resolution && field.type == Cloudini::FieldType::FLOAT32) {
+    } else if (
+        default_resolution && field.type == Cloudini::FieldType::FLOAT32 && !Cloudini::isPackedColorField(field)) {
       field.resolution = *default_resolution;
     }
   }

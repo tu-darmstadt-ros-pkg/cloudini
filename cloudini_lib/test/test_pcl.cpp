@@ -15,6 +15,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <pcl/conversions.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -90,6 +91,51 @@ TEST(Cloudini, PCD_Encode) {
     ASSERT_NEAR(cloud.points[i].y, cloud_out.points[i].y, tolerance) << "i:" << i;
     ASSERT_NEAR(cloud.points[i].z, cloud_out.points[i].z, tolerance) << "i:" << i;
     ASSERT_NEAR(cloud.points[i].intensity, cloud_out.points[i].intensity, tolerance) << "i:" << i;
+  }
+}
+
+// pcl::PointXYZRGB stores the color in a FLOAT32 field named "rgb" whose bit pattern is a packed
+// integer. Lossy encoding must leave it untouched instead of quantizing it to zero.
+TEST(Cloudini, PCL_PackedColorSurvivesLossyRoundtrip) {
+  constexpr float kResolution = 0.001F;
+  constexpr size_t kPointCount = 256;
+
+  pcl::PointCloud<pcl::PointXYZRGB> cloud;
+  cloud.resize(kPointCount);
+  cloud.width = kPointCount;
+  cloud.height = 1;
+  for (size_t i = 0; i < kPointCount; ++i) {
+    auto& point = cloud.points[i];
+    point.x = 0.01F * static_cast<float>(i);
+    point.y = -0.02F * static_cast<float>(i);
+    point.z = 0.5F + 0.03F * static_cast<float>(i);
+    point.r = static_cast<uint8_t>(i);
+    point.g = static_cast<uint8_t>(255 - i);
+    point.b = static_cast<uint8_t>(i * 7);
+  }
+
+  pcl::PCLPointCloud2 cloud_msg;
+  pcl::toPCLPointCloud2(cloud, cloud_msg);
+
+  std::vector<uint8_t> serialized_data;
+  PCLPointCloudEncode(cloud_msg, serialized_data, kResolution);
+
+  pcl::PCLPointCloud2 decoded_msg;
+  PCLPointCloudDecode(ConstBufferView(serialized_data.data(), serialized_data.size()), decoded_msg);
+
+  pcl::PointCloud<pcl::PointXYZRGB> cloud_out;
+  pcl::fromPCLPointCloud2(decoded_msg, cloud_out);
+
+  ASSERT_EQ(cloud_out.points.size(), cloud.points.size());
+
+  const auto tolerance = kResolution * 1.01F;
+  for (size_t i = 0; i < cloud.points.size(); ++i) {
+    ASSERT_NEAR(cloud.points[i].x, cloud_out.points[i].x, tolerance) << "i:" << i;
+    ASSERT_NEAR(cloud.points[i].y, cloud_out.points[i].y, tolerance) << "i:" << i;
+    ASSERT_NEAR(cloud.points[i].z, cloud_out.points[i].z, tolerance) << "i:" << i;
+    ASSERT_EQ(cloud.points[i].r, cloud_out.points[i].r) << "i:" << i;
+    ASSERT_EQ(cloud.points[i].g, cloud_out.points[i].g) << "i:" << i;
+    ASSERT_EQ(cloud.points[i].b, cloud_out.points[i].b) << "i:" << i;
   }
 }
 
