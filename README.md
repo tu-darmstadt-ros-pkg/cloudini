@@ -3,6 +3,7 @@
 [![ROS2 Humble](https://github.com/facontidavide/cloudini/actions/workflows/ros-humble.yaml/badge.svg)](https://github.com/facontidavide/cloudini/actions/workflows/ros-humble.yaml)
 [![ROS2 Jazzy](https://github.com/facontidavide/cloudini/actions/workflows/ros-jazzy.yaml/badge.svg)](https://github.com/facontidavide/cloudini/actions/workflows/ros-jazzy.yaml)
 [![ROS2 Kilted](https://github.com/facontidavide/cloudini/actions/workflows/ros-kilted.yaml/badge.svg)](https://github.com/facontidavide/cloudini/actions/workflows/ros-kilted.yaml)
+[![ROS2 Lyrical](https://github.com/facontidavide/cloudini/actions/workflows/ros-lyrical.yaml/badge.svg)](https://github.com/facontidavide/cloudini/actions/workflows/ros-lyrical.yaml)
 [![ROS2 Rolling](https://github.com/facontidavide/cloudini/actions/workflows/ros-rolling.yaml/badge.svg)](https://github.com/facontidavide/cloudini/actions/workflows/ros-rolling.yaml)
 
 ![Cloudini](logo.png)
