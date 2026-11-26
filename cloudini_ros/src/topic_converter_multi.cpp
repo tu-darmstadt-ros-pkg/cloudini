@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include <cloudini_lib/cloudini.hpp>
 #include <cloudini_lib/ros_msg_utils.hpp>
+#include <optional>
 #include <rclcpp/generic_publisher.hpp>
 #include <rclcpp/generic_subscription.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -50,11 +52,23 @@ class CloudiniPointcloudConverterMulti : public rclcpp::Node {
   }
 
  private:
-  // generic subscribers for compressed point cloud messages
-  std::vector<rclcpp::GenericSubscription::SharedPtr> point_cloud_subscribers_;
+  struct TopicPair {
+    std::string input_topic;
+    std::string output_topic;
+    std::optional<rclcpp::QoS> input_qos;  // of the current subscription
+    rclcpp::GenericSubscription::SharedPtr subscriber;
+    rclcpp::GenericPublisher::SharedPtr publisher;
+  };
 
-  // generic publishers for sensor_msgs/msg/PointCloud2 (but... raw DDS message)
-  std::vector<rclcpp::GenericPublisher::SharedPtr> point_cloud_publishers_;
+  // Subscribes with the QoS that the publishers of the input topic offer, once there is one, and subscribes
+  // again when what they offer changes: a reader's QoS cannot change, and a RELIABLE reader receives nothing
+  // from a BEST_EFFORT publisher. Called at start and by a timer, for every topic pair.
+  void adaptToPublishers(size_t topic_index);
+
+  std::vector<TopicPair> topics_;
+  std::string input_topic_type_;
+  std::string output_topic_type_;
+  rclcpp::TimerBase::SharedPtr graph_poll_timer_;
 
   // Per-topic buffers
   std::vector<std::vector<uint8_t>> output_raw_messages_;
@@ -70,6 +84,7 @@ class CloudiniPointcloudConverterMulti : public rclcpp::Node {
 };
 //-----------------------------------------------------
 
+namespace {
 rclcpp::QoS adapt_request_to_offers(
     const std::string& topic_name, const std::vector<rclcpp::TopicEndpointInfo>& endpoints) {
   rclcpp::QoS request_qos(rmw_qos_profile_default.depth);
@@ -103,6 +118,7 @@ rclcpp::QoS adapt_request_to_offers(
   }
   return request_qos;
 }
+}  // namespace
 //-----------------------------------------------------
 
 CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp::NodeOptions& options)
@@ -147,8 +163,8 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
   const std::string compressed_topic_type = "point_cloud_interfaces/msg/CompressedPointCloud2";
   const std::string pointcloud_topic_type = "sensor_msgs/msg/PointCloud2";
 
-  const std::string input_topic_type = compressing_ ? pointcloud_topic_type : compressed_topic_type;
-  const std::string output_topic_type = compressing_ ? compressed_topic_type : pointcloud_topic_type;
+  input_topic_type_ = compressing_ ? pointcloud_topic_type : compressed_topic_type;
+  output_topic_type_ = compressing_ ? compressed_topic_type : pointcloud_topic_type;
 
   // Handle resolution parameter
   const size_t num_topics = input_topics.size();
@@ -171,55 +187,68 @@ CloudiniPointcloudConverterMulti::CloudiniPointcloudConverterMulti(const rclcpp:
     throw std::runtime_error("Resolution parameter size mismatch");
   }
 
-  // Reserve space for vectors
-  point_cloud_subscribers_.reserve(num_topics);
-  point_cloud_publishers_.reserve(num_topics);
+  topics_.resize(num_topics);
   output_raw_messages_.resize(num_topics);
   output_messages_.resize(num_topics);
   tot_original_sizes_.resize(num_topics, 0);
   tot_compressed_sizes_.resize(num_topics, 0);
   message_counts_.resize(num_topics, 0);
 
-  // Create subscribers and publishers for each topic pair
   for (size_t i = 0; i < num_topics; ++i) {
-    const auto& input_topic = input_topics[i];
-    const auto& output_topic = output_topics[i];
-
-    // Initialize point cloud type support
-    auto publisher_info = this->get_publishers_info_by_topic(input_topic);
-    auto detected_qos = adapt_request_to_offers(input_topic, publisher_info);
-
-    // Create callback with topic index
-    std::function<void(std::shared_ptr<rclcpp::SerializedMessage>)> callback =
-        std::bind(&CloudiniPointcloudConverterMulti::callback, this, i, std::placeholders::_1);
-
-    RCLCPP_INFO(
-        this->get_logger(), "[%zu] Subscribing to topic '%s' of type '%s' (resolution: %.6f)", i, input_topic.c_str(),
-        input_topic_type.c_str(), resolutions_[i]);
-
-    // Create a generic subscriber for point cloud messages
-    auto subscriber = this->create_generic_subscription(
-        input_topic,       //
-        input_topic_type,  //
-        detected_qos,      //
-        callback);
-    point_cloud_subscribers_.push_back(subscriber);
-
-    RCLCPP_INFO(
-        this->get_logger(), "[%zu] Publishing to topic '%s' of type '%s'", i, output_topic.c_str(),
-        output_topic_type.c_str());
-
-    // Create a generic publisher for point cloud messages
-    auto publisher = this->create_generic_publisher(output_topic, output_topic_type, detected_qos);
-    point_cloud_publishers_.push_back(publisher);
+    topics_[i].input_topic = input_topics[i];
+    topics_[i].output_topic = output_topics[i];
+    adaptToPublishers(i);
+    if (!topics_[i].input_qos) {
+      RCLCPP_INFO(this->get_logger(), "[%zu] Waiting for a publisher on topic '%s'", i, input_topics[i].c_str());
+    }
   }
+  graph_poll_timer_ = this->create_wall_timer(std::chrono::milliseconds(500), [this] {
+    for (size_t i = 0; i < topics_.size(); ++i) {
+      adaptToPublishers(i);
+    }
+  });
 
   RCLCPP_INFO(this->get_logger(), "Successfully initialized %zu topic pairs", num_topics);
 }
 
+void CloudiniPointcloudConverterMulti::adaptToPublishers(size_t topic_index) {
+  TopicPair& topic = topics_[topic_index];
+  const auto publishers = this->get_publishers_info_by_topic(topic.input_topic);
+  if (publishers.empty()) {
+    return;  // nothing to adapt to: keep the current subscription, if any
+  }
+  rclcpp::QoS qos = adapt_request_to_offers(topic.input_topic, publishers);
+  if (topic.input_qos && topic.input_qos->durability() == rclcpp::DurabilityPolicy::Volatile) {
+    // A VOLATILE reader matches every publisher: subscribing again as TRANSIENT_LOCAL would only receive
+    // the clouds already converted a second time.
+    qos.durability_volatile();
+  }
+  if (topic.input_qos == qos) {
+    return;
+  }
+  const bool reliable = qos.reliability() == rclcpp::ReliabilityPolicy::Reliable;
+  const bool transient_local = qos.durability() == rclcpp::DurabilityPolicy::TransientLocal;
+  RCLCPP_INFO(
+      this->get_logger(), "[%zu] Subscribing to topic '%s' of type '%s' (%s, %s, resolution: %.6f)", topic_index,
+      topic.input_topic.c_str(), input_topic_type_.c_str(), reliable ? "RELIABLE" : "BEST_EFFORT",
+      transient_local ? "TRANSIENT_LOCAL" : "VOLATILE", resolutions_[topic_index]);
+  // The publisher exists before the first message arrives. Its QoS stays, so that the subscribers of the
+  // output keep matching.
+  if (!topic.publisher) {
+    RCLCPP_INFO(
+        this->get_logger(), "[%zu] Publishing to topic '%s' of type '%s'", topic_index, topic.output_topic.c_str(),
+        output_topic_type_.c_str());
+    topic.publisher = this->create_generic_publisher(topic.output_topic, output_topic_type_, qos);
+  }
+  std::function<void(std::shared_ptr<rclcpp::SerializedMessage>)> callback =
+      std::bind(&CloudiniPointcloudConverterMulti::callback, this, topic_index, std::placeholders::_1);
+  topic.subscriber = this->create_generic_subscription(topic.input_topic, input_topic_type_, qos, callback);
+  topic.input_qos = qos;
+}
+
 void CloudiniPointcloudConverterMulti::callback(size_t topic_index, std::shared_ptr<rclcpp::SerializedMessage> msg) {
   // Skip processing if there are no subscribers
-  if (point_cloud_publishers_[topic_index]->get_subscription_count() == 0) {
+  if (topics_[topic_index].publisher->get_subscription_count() == 0) {
     return;
   }
 
@@ -241,7 +270,7 @@ void CloudiniPointcloudConverterMulti::callback(size_t topic_index, std::shared_
   // STEP 3: publish the output message
   output_messages_[topic_index].get_rcl_serialized_message().buffer_length = output_raw_messages_[topic_index].size();
   output_messages_[topic_index].get_rcl_serialized_message().buffer = output_raw_messages_[topic_index].data();
-  point_cloud_publishers_[topic_index]->publish(output_messages_[topic_index]);
+  topics_[topic_index].publisher->publish(output_messages_[topic_index]);
 
   tot_original_sizes_[topic_index] += input_msg.buffer_length;
   tot_compressed_sizes_[topic_index] += output_raw_messages_[topic_index].size();
