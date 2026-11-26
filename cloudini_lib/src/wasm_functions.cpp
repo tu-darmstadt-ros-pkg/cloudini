@@ -62,7 +62,13 @@ uint32_t cldn_ComputeCompressedSize(uintptr_t dds_msg_ptr, uint32_t dds_msg_size
 
     Cloudini::EncodingInfo encoding_info = cloudini_ros::toEncodingInfo(pc_info);
 
-    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, encoding_info.fields, resolution);
+    for (auto& field : encoding_info.fields) {
+      if (auto res = Cloudini::defaultFieldResolution(field, resolution)) {
+        field.resolution = res;
+      }
+    }
+
+    Cloudini::RefineResolutionsToData(encoding_info, pc_info.data);
 
     // Don't use static - it causes memory leaks in WASM
     std::vector<uint8_t> compressed_cloud;
@@ -172,7 +178,11 @@ uint32_t cldn_EncodePointcloudMessage(
 
     Cloudini::EncodingInfo encoding_info = cloudini_ros::toEncodingInfo(pc_info);
 
-    cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, encoding_info.fields, resolution);
+    for (auto& field : encoding_info.fields) {
+      if (auto res = Cloudini::defaultFieldResolution(field, resolution)) {
+        field.resolution = res;
+      }
+    }
 
     // Verify data size matches expected size
     const size_t expected_size = pc_info.width * pc_info.height * pc_info.point_step;
@@ -180,6 +190,7 @@ uint32_t cldn_EncodePointcloudMessage(
     if (pc_info.data.size() != expected_size) {
       return 0;
     }
+    Cloudini::RefineResolutionsToData(encoding_info, pc_info.data);
     Cloudini::PointcloudEncoder pc_encoder(encoding_info);
     const size_t points_count = pc_info.data.size() / encoding_info.point_step;
     const size_t max_size = Cloudini::MaxCompressedSize(encoding_info, points_count, true);
@@ -209,17 +220,19 @@ uint32_t cldn_EncodePointcloudMessage(
 uint32_t cldn_EncodePointcloudData(
     const char* header_as_yaml, const uintptr_t pc_data_ptr, uint32_t pc_data_size, uintptr_t output_data_ptr) {
   try {
-    const Cloudini::EncodingInfo encoding_info = Cloudini::EncodingInfoFromYAML(header_as_yaml);
+    Cloudini::EncodingInfo encoding_info = Cloudini::EncodingInfoFromYAML(header_as_yaml);
 
     // Verify data size matches expected size
-    uint32_t expected_size = encoding_info.width * encoding_info.height * encoding_info.point_step;
+    const uint64_t expected_size = uint64_t(encoding_info.width) * encoding_info.height * encoding_info.point_step;
 
     if (pc_data_size != expected_size) {
-      EM_ASM({ console.error('Data size mismatch: expected', $0, 'but got', $1); }, expected_size, pc_data_size);
+      EM_ASM({ console.error('Data size mismatch: expected', $0, 'but got', $1); }, double(expected_size), pc_data_size);
       return 0;
     }
 
     Cloudini::ConstBufferView pc_data_view(reinterpret_cast<const uint8_t*>(pc_data_ptr), pc_data_size);
+    // like every other encode path: coarsen the resolutions to the grid the data lies on (lossless at r/2)
+    Cloudini::RefineResolutionsToData(encoding_info, pc_data_view);
     Cloudini::PointcloudEncoder pc_encoder(encoding_info);
     std::vector<uint8_t> compressed_output;
     const auto compressed_size = pc_encoder.encode(pc_data_view, compressed_output);

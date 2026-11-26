@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0] - 2026-11-20
+
+Follows Cloudini 1.5.0.
+
+### Changed
+- Faster decoding: the WebAssembly module uses WASM SIMD and decodes typical lidar clouds
+  about 2x faster (1.3x to 4x depending on the sensor).
+- Needs an engine with WASM SIMD: the Foxglove desktop app, Chrome or Edge 91+, Firefox 89+,
+  Safari 16.4+.
+- Faster decoding of lossless fields and of float fields without a resolution.
+- Updated dependencies (`@foxglove/extension` 3.3.0, `@foxglove/schemas` 2.3.1).
+
+### Fixed
+- A cloud whose header has a subnormal resolution (below 1.2e-38) failed with
+  "Failed to parse float value".
+
+## [1.4.1] - 2026-09-29
+
+Follows Cloudini 1.4.1 (an MSVC build fix); no changes in the extension.
+
+## [1.4.0] - 2026-09-28
+
+The extension version now follows the Cloudini release it is built from.
+
+### Added
+- Decodes the V6 wire format, the default of Cloudini 1.4.0. Extension 1.2.2 and
+  earlier fail on V6 messages with "Unsupported encoding version. Current is:5, got: 6".
+
+### Changed
+- Faster decoding of V4, V5 and V6 clouds.
+- Messages from a newer Cloudini fail with an error that asks to update the extension.
+
+### Fixed
+- Hardened decoding of corrupted input (V5 RLE heap overflow, writes past the output).
+
+## [1.2.2] - 2026-06-04
+
+- Released as an installable `.foxe` again.
+
 ## [0.0.1] - 2025-01-26
 
 ### Added

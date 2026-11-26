@@ -60,7 +60,18 @@ EncodingOptions EncodingOptionsFromString(std::string_view str);
 CompressionOption CompressionOptionFromString(std::string_view str);
 FieldType FieldTypeFromString(std::string_view str);
 
-constexpr const uint8_t kEncodingVersion = 5;
+namespace detail {
+struct V6EncoderState;
+}
+
+// Version encoders write by default: 6. Decoders from 1.3.1 and earlier read up to version 5; set
+// EncodingInfo::version = 5 to write for them.
+constexpr const uint8_t kEncodingVersion = 6;
+// Newest version the decoder reads.
+constexpr const uint8_t kMaxEncodingVersion = 6;
+// Oldest version the tools and the ROS nodes offer. PointcloudEncoder also writes versions 2 and 3, for old
+// readers.
+constexpr const uint8_t kMinEncodingVersion = 4;
 
 struct EncodingInfo {
   // Fields in the point cloud
@@ -85,8 +96,13 @@ struct EncodingInfo {
   CompressionOption compression_opt = CompressionOption::ZSTD;
 
   // When false, compression runs in the calling thread instead of a worker thread.
-  // Ignored when compression_opt == NONE.
+  // Ignored when compression_opt == NONE. False by default in WebAssembly builds without pthreads, where
+  // starting a thread throws.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+  bool use_threads = false;
+#else
   bool use_threads = true;
+#endif
 
   uint8_t version = kEncodingVersion;
 
@@ -111,6 +127,7 @@ struct EncodingInfo {
 };
 
 constexpr const char* kMagicHeader = "CLOUDINI_V";
+
 constexpr int kMagicHeaderLength = 10;
 
 enum class HeaderEncoding { BINARY, YAML };
@@ -145,6 +162,21 @@ EncodingInfo EncodingInfoFromYAML(std::string_view yaml);
 size_t MaxCompressedSize(const EncodingInfo& info, size_t points_count, bool include_header = true);
 
 /**
+ * @brief Coarsen the resolution of lossy floating point fields to the grid their values actually lie on.
+ *
+ * A field quantized with resolution `r` whose values are all integers (typical of `intensity` or `ring`
+ * stored as FLOAT32) gets resolution 1, and is then stored exactly, with much smaller deltas. Otherwise,
+ * if every value is a multiple of `k * r` for an integer k > 1 (e.g. a reflectance with 0.01 steps
+ * quantized at 0.001), the resolution becomes `k * r`. Every value is checked: the new resolution is kept
+ * only if every value still decodes within r / 2 (plus 0.1% of `r`) of the original. For large values
+ * the float rounding of `k * r` usually rules it out.
+ *
+ * Only EncodingOptions::LOSSY is affected. The result depends on the data: call it on every cloud,
+ * before creating the PointcloudEncoder. Readers need nothing new: the resolution is in the header.
+ */
+void RefineResolutionsToData(EncodingInfo& info, ConstBufferView cloud_data);
+
+/**
  * @brief PointcloudEncoder is used to encode a point cloud into a compressed format.
  *
  * The encoder uses two stages of compression:
@@ -176,6 +208,10 @@ class PointcloudEncoder {
     return header_;
   }
 
+  // Changes the width and height written in the header of the next encoded clouds. Everything else in
+  // the EncodingInfo stays; use it to encode clouds of varying size with the same encoder.
+  void setCloudSize(uint32_t width, uint32_t height);
+
   ~PointcloudEncoder();
 
  private:
@@ -188,10 +224,19 @@ class PointcloudEncoder {
   size_t buffer_capacity_ = 0;
   std::vector<uint8_t> header_;
 
+  // Worst-case sized output of encode(cloud, std::vector&), kept between calls (never zero-filled)
+  std::unique_ptr<uint8_t[]> output_scratch_;
+  size_t output_scratch_capacity_ = 0;
+
   // Double buffering and threading
   std::unique_ptr<uint8_t[]> buffer_compressing_;
   size_t buffer_compressing_capacity_ = 0;
   size_t buffer_compressing_size_ = 0;
+  // offsets in buffer_compressing_ where stage 2 should start a new compressed block
+  std::vector<size_t> block_starts_compressing_;
+
+  // V6 encoder state kept between encode() calls (detected lag, predictor per chunk, buffers)
+  std::unique_ptr<detail::V6EncoderState> v6_state_;
 
   // Thread synchronization
   std::mutex mutex_;
@@ -208,6 +253,22 @@ class PointcloudEncoder {
   std::exception_ptr worker_exception_;
 
   BufferView output_view_;
+};
+
+/**
+ * @brief Keeps one PointcloudEncoder for a stream of clouds (e.g. one topic).
+ *
+ * The encoder is reused while the fields, point step, options and version stay the same; a change of
+ * width or height only updates its header. Reuse matters for V6: the encoder keeps the lag, the predictor
+ * and mask kind it chose for each chunk and the coding modes of the integer fields, and codes the next
+ * clouds in a single pass.
+ */
+class PointcloudEncoderCache {
+ public:
+  PointcloudEncoder& get(const EncodingInfo& info);
+
+ private:
+  std::unique_ptr<PointcloudEncoder> encoder_;
 };
 
 /**
@@ -233,13 +294,15 @@ class PointcloudDecoder {
   }
 
  private:
+  void decodeImpl(const EncodingInfo& info, ConstBufferView compressed_data, BufferView output);
+
   void updateDecoders(const EncodingInfo& info);
 
   void decodeChunk(
       const EncodingInfo& info, ConstBufferView compressed_data, BufferView& output, size_t expected_points);
 
   std::vector<std::unique_ptr<FieldDecoder>> decoders_;
-  std::vector<uint8_t> decompressed_buffer_;
+  std::vector<uint8_t> decompressed_buffer_;  // stage 2 output of very large chunks only
   size_t min_encoded_point_bytes_ = 0;
 };
 }  // namespace Cloudini

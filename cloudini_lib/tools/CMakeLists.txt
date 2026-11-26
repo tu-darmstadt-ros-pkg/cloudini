@@ -1,6 +1,11 @@
 
 
-add_library(mcap_converter src/mcap_converter.cpp)
+# STATIC on purpose: this is an internal helper linked into the CLI executables.
+# With BUILD_SHARED_LIBS=ON (e.g. the conda package) an unqualified add_library
+# would produce a libmcap_converter.so that is never installed, leaving the CLI
+# with a dangling runtime dependency.
+add_library(mcap_converter STATIC src/mcap_converter.cpp)
+set_property(TARGET mcap_converter PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mcap_converter
   PUBLIC
    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -61,6 +66,7 @@ add_executable(mcap_codec_benchmark
 target_link_libraries(mcap_codec_benchmark
   PRIVATE
     cloudini_lib
+    mcap_converter
     LZ4::lz4_static
     zstd::libzstd_static
     mcap::mcap

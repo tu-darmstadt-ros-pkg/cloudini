@@ -36,10 +36,7 @@ EncodingInfo ConvertToEncodingInfo(const sensor_msgs::msg::PointCloud2& msg, flo
     field.name = msg_field.name;
     field.offset = msg_field.offset;
     field.type = static_cast<FieldType>(msg_field.datatype);
-    // Packed color fields are excluded: their bits are an integer, not a real value.
-    field.resolution = (field.type == FieldType::FLOAT32 && !isPackedColorField(field))  //
-                           ? std::optional<float>(resolution)
-                           : std::nullopt;
+    field.resolution = defaultFieldResolution(field, resolution);
     info.fields.push_back(field);
   }
   return info;
@@ -78,11 +75,13 @@ cloudini_ros::RosPointCloud2 ConvertToRosPointCloud2(const sensor_msgs::msg::Poi
 }
 
 void SerializeCompressedPointCloud2(
-    const sensor_msgs::msg::PointCloud2& msg, float resolution, std::vector<uint8_t>& serialized_dds_msg) {
+    const sensor_msgs::msg::PointCloud2& msg, float resolution, std::vector<uint8_t>& serialized_dds_msg,
+    uint8_t encoding_version, PointcloudEncoderCache* encoder_cache) {
   auto pc_info = ConvertToRosPointCloud2(msg);
   cloudini_ros::applyResolutionProfile(cloudini_ros::ResolutionProfile{}, pc_info.fields, resolution);
-  const auto encoding_info = cloudini_ros::toEncodingInfo(pc_info);
-  cloudini_ros::convertPointCloud2ToCompressedCloud(pc_info, encoding_info, serialized_dds_msg);
+  auto encoding_info = cloudini_ros::toEncodingInfo(pc_info);
+  encoding_info.version = encoding_version;
+  cloudini_ros::convertPointCloud2ToCompressedCloud(pc_info, encoding_info, serialized_dds_msg, encoder_cache);
 }
 
 }  // namespace Cloudini

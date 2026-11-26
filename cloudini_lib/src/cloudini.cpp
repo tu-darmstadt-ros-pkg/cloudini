@@ -16,23 +16,28 @@
 
 #include "cloudini_lib/cloudini.hpp"
 
+#if defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
-#include <charconv>
+#include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <locale>
+#include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
 
 #include "chunk_writer.hpp"
-#include "codec_common.hpp"
 #include "cloudini_lib/encoding_utils.hpp"
 #include "cloudini_lib/yaml_parser.hpp"
+#include "codec_common.hpp"
 #include "v4_codec.hpp"
 #include "v5_codec.hpp"
-#include "lz4.h"
-#include "zstd.h"
+#include "v6_codec.hpp"
 
 namespace Cloudini {
 
@@ -44,6 +49,60 @@ void ensureScratchBuffer(std::unique_ptr<uint8_t[]>& buffer, size_t& capacity, s
   }
   buffer.reset(new uint8_t[required_capacity]);
   capacity = required_capacity;
+}
+
+// The YAML header is part of the wire format: numbers must always be written and
+// parsed with '.' as decimal separator and without thousands grouping, whatever
+// the C locale (setlocale) or the global C++ locale (std::locale::global) is.
+// We use streams imbued with the classic locale rather than std::to_chars /
+// std::from_chars for floats, because those are not available on every
+// standard library we support (e.g. older libc++ used by Emscripten / macOS).
+
+// Parses a number in the classic locale; trailing whitespace is allowed. False when `str` is not a number
+// or is too large for a float.
+bool ParseFloat(const std::string& str, float& value) {
+  std::istringstream iss(str);
+  iss.imbue(std::locale::classic());
+  iss >> value;
+  if (iss.fail()) {
+    // libc++ (macOS, Emscripten) also fails when the value is a subnormal float, which libstdc++ reads:
+    // parse it as a double, where it is a normal number.
+    iss = std::istringstream(str);
+    iss.imbue(std::locale::classic());
+    double wide = 0.0;
+    iss >> wide;
+    if (iss.fail() || !(std::fabs(wide) < static_cast<double>(std::numeric_limits<float>::min()))) {
+      return false;
+    }
+    value = static_cast<float>(wide);
+  }
+  iss >> std::ws;
+  return iss.eof();
+}
+
+// Shortest representation that parses back to exactly the same float.
+std::string FloatToString(float value) {
+  std::string out;
+  for (int precision = 6; precision <= std::numeric_limits<float>::max_digits10; ++precision) {
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    oss << std::setprecision(precision) << value;
+    out = oss.str();
+
+    float parsed = 0.0F;
+    if (ParseFloat(out, parsed) && parsed == value) {
+      break;
+    }
+  }
+  return out;
+}
+
+float FloatFromString(const std::string& str) {
+  float value = 0.0F;
+  if (!ParseFloat(str, value)) {
+    throw std::runtime_error("Failed to parse float value: " + str);
+  }
+  return value;
 }
 
 }  // namespace
@@ -167,9 +226,7 @@ CompressionOption CompressionOptionFromString(std::string_view str) {
 
 std::string EncodingInfoToYAML(const EncodingInfo& info) {
   std::ostringstream yaml;
-  // Force '.' as the decimal separator regardless of the process's global C++ locale, so the
-  // wire format stays canonical (the reader parses with std::from_chars, which only accepts '.').
-  yaml.imbue(std::locale::classic());
+  yaml.imbue(std::locale::classic());  // no thousands grouping in integers
   yaml << "version: " << static_cast<int>(info.version) << "\n";
   yaml << "width: " << info.width << "\n";
   yaml << "height: " << info.height << "\n";
@@ -187,7 +244,7 @@ std::string EncodingInfoToYAML(const EncodingInfo& info) {
     yaml << "    offset: " << field.offset << "\n";
     yaml << "    type: " << ToString(field.type) << "\n";
     if (field.resolution.has_value()) {
-      yaml << "    resolution: " << field.resolution.value() << "\n";
+      yaml << "    resolution: " << FloatToString(field.resolution.value()) << "\n";
     } else {
       yaml << "    resolution: null\n";
     }
@@ -226,14 +283,7 @@ EncodingInfo EncodingInfoFromYAML(std::string_view yaml) {
 
       std::string res_str = field_node["resolution"].as<std::string>();
       if (res_str != "null") {
-        // std::from_chars is locale-independent (always '.'). std::stof/strtof would honor the
-        // C locale LC_NUMERIC, which Qt apps (rviz) set to the system locale on startup; under a
-        // comma-decimal locale that misparses "0.001" as 0.0 and crashes the lossy float decoder.
-        float res = 0.0f;
-        const auto [ptr, ec] = std::from_chars(res_str.data(), res_str.data() + res_str.size(), res);
-        if (ec == std::errc{} && res > 0.0f) {  // res > 0 mirrors the binary header path below
-          field.resolution = res;
-        }
+        field.resolution = FloatFromString(res_str);
       }
       info.fields.push_back(field);
     }
@@ -259,6 +309,195 @@ size_t ComputeHeaderSize(const std::vector<PointField>& fields) {
   return header_size;
 }
 
+namespace {
+
+double readFloatField(const uint8_t* ptr, FieldType type) {
+  if (type == FieldType::FLOAT32) {
+    float value;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+  }
+  double value;
+  memcpy(&value, ptr, sizeof(value));
+  return value;
+}
+
+// A refined grid may add at most this fraction of the original resolution to the decoding error.
+constexpr double kRefinementTolerance = 1e-3;
+
+// Coarsest resolution (a multiple of `resolution`) whose grid contains every value of the field.
+float refinedResolution(const PointField& field, float resolution, ConstBufferView cloud_data, size_t point_step) {
+  const size_t points = cloud_data.size() / point_step;
+  auto value_at = [&](size_t i) {
+    return readFloatField(cloud_data.data() + i * point_step + field.offset, field.type);
+  };
+
+  // Integer values: stored exactly with resolution 1.
+  bool all_integers = true;
+  bool any_value = false;
+  size_t first = 0;
+#if defined(__SSE4_1__)
+  // FLOAT32, 4 values per step: the same answers as the loop below (an infinity returns `resolution`
+  // wherever it is, so the order of the checks does not matter).
+  if (field.type == FieldType::FLOAT32) {
+    const uint8_t* base = cloud_data.data() + field.offset;
+    const __m128 sign = _mm_set1_ps(-0.0f), infinity = _mm_set1_ps(INFINITY);
+    int any_value_bits = 0;
+    for (; first + 4 <= points; first += 4) {
+      // built in registers: a 16-byte load of 4 separate 4-byte stores would miss store-to-load forwarding
+      const uint8_t* p = base + first * point_step;
+      float f0, f1, f2, f3;
+      memcpy(&f0, p, sizeof(float));
+      memcpy(&f1, p + point_step, sizeof(float));
+      memcpy(&f2, p + 2 * point_step, sizeof(float));
+      memcpy(&f3, p + 3 * point_step, sizeof(float));
+      const __m128 v = _mm_setr_ps(f0, f1, f2, f3);
+      const __m128 is_value = _mm_cmpord_ps(v, v);
+      if (_mm_movemask_ps(_mm_cmpeq_ps(_mm_andnot_ps(sign, v), infinity)) != 0) {
+        return resolution;
+      }
+      any_value_bits |= _mm_movemask_ps(is_value);
+      const __m128 is_integer = _mm_cmpeq_ps(_mm_round_ps(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC), v);
+      if (_mm_movemask_ps(_mm_andnot_ps(is_integer, is_value)) != 0) {
+        break;  // a fraction among these 4 values: the loop below stops at it
+      }
+    }
+    any_value = any_value_bits != 0;
+  }
+#endif
+  for (size_t i = first; i < points; ++i) {
+    const double value = value_at(i);
+    if (std::isnan(value)) {
+      continue;
+    }
+    if (!std::isfinite(value)) {
+      return resolution;
+    }
+    any_value = true;
+    if (value != std::nearbyint(value)) {
+      all_integers = false;
+      break;
+    }
+  }
+  if (!any_value) {
+    return resolution;
+  }
+  if (all_integers) {
+    return std::max(resolution, 1.0F);
+  }
+
+  // Otherwise: greatest common divisor g of the quantized values. With round(v / r) = k * g, v is within
+  // r / 2 of k * (g * r), so the coarser resolution g * r keeps the original error bound.
+  const double inv_resolution = 1.0 / static_cast<double>(resolution);
+  double max_abs_value = 0.0;
+  double max_quantized = 0.0;
+  uint64_t gcd = 0;
+  double gcd_value = 0.0;
+  double inv_gcd = 0.0;
+  for (size_t i = 0; i < points; ++i) {
+    const double value = value_at(i);
+    if (std::isnan(value)) {
+      continue;
+    }
+    if (!std::isfinite(value)) {
+      return resolution;
+    }
+    const double quantized = std::fabs(std::nearbyint(value * inv_resolution));
+    if (quantized >= 9.0e15) {  // beyond the exact integers of a double
+      return resolution;
+    }
+    max_abs_value = std::max(max_abs_value, std::fabs(value));
+    max_quantized = std::max(max_quantized, quantized);
+    // cheap divisibility test first; a real gcd only when it fails
+    if (gcd != 0 && std::nearbyint(quantized * inv_gcd) * gcd_value == quantized) {
+      continue;
+    }
+    gcd = std::gcd(gcd, static_cast<uint64_t>(quantized));
+    if (gcd == 1) {
+      return resolution;
+    }
+    gcd_value = static_cast<double>(gcd);
+    inv_gcd = 1.0 / gcd_value;
+  }
+  if (gcd <= 1) {
+    return resolution;
+  }
+
+  // The header stores the new resolution as a float R, which is not exactly g * r, and the decoder
+  // multiplies in the precision of the field: for large values k * R can land further from v than
+  // the original q * r. Decode every value both ways, as the decoder does, and keep R only if no
+  // value decodes further than r / 2 + kRefinementTolerance * r from the original. The bound is absolute:
+  // for large values the float path of V4 is itself further than r / 2, but V6 quantizes those in double
+  // precision and stays within r / 2, so "no worse than the float path" would loosen V6's bound.
+  const double exact = static_cast<double>(resolution) * static_cast<double>(gcd);
+  const float refined = static_cast<float>(exact);
+  const double tolerance = kRefinementTolerance * static_cast<double>(resolution);
+
+  // Cheap sufficient condition first, typical of small values (a reflectance in [0, 1]): while the steps
+  // k = q / g stay small, the encoders compute exactly k (v / R is within 1 / (2g) + float rounding of it),
+  // and k * R differs from q * r by at most k * |R - g * r| plus the rounding of the product at |v|.
+  const bool is_float = field.type == FieldType::FLOAT32;
+  const double max_steps = max_quantized / static_cast<double>(gcd);
+  const double drift = max_steps * std::fabs(static_cast<double>(refined) - exact);
+  const double product_rounding =
+      is_float ? static_cast<double>(
+                     std::nextafter(static_cast<float>(max_abs_value), INFINITY) - static_cast<float>(max_abs_value))
+               : std::nextafter(max_abs_value, INFINITY) - max_abs_value;
+  if (max_steps < (is_float ? 0x1p20 : 0x1p50) && drift + product_rounding <= tolerance) {
+    return refined;
+  }
+
+  // Otherwise check every value:
+  // Worst decoding error of `value` with resolution `res`, computed as the encoders and decoders do.
+  auto decode_error = [&field](double value, float res) {
+    if (field.type == FieldType::FLOAT64) {
+      // FieldEncoderFloat_Lossy<double>: round(v * (1 / r)), decoded as steps * r
+      const double steps = std::round(value * (1.0 / static_cast<double>(res)));
+      return std::fabs(steps * static_cast<double>(res) - value);
+    }
+    // FLOAT32, in float arithmetic: FieldEncoderFloatN_Lossy multiplies by 1.0F / r and rounds to
+    // nearest even (SSE) or away from zero; FieldEncoderFloat_Lossy<float> multiplies by
+    // float(1.0 / r). The product is rounded to float precision before the rounding to an integer.
+    const float v = static_cast<float>(value);
+    double worst = 0.0;
+    for (const float multiplier : {1.0F / res, static_cast<float>(1.0 / static_cast<double>(res))}) {
+      const float scaled = v * multiplier;
+      for (const float steps : {std::nearbyint(scaled), std::round(scaled)}) {
+        worst = std::max(worst, std::fabs(static_cast<double>(steps * res) - value));
+      }
+    }
+    return worst;
+  };
+  const double half_resolution = 0.5 * static_cast<double>(resolution);
+  for (size_t i = 0; i < points; ++i) {
+    const double value = value_at(i);
+    if (std::isnan(value)) {
+      continue;
+    }
+    const double refined_error = decode_error(value, refined);
+    if (refined_error > half_resolution + tolerance) {
+      return resolution;
+    }
+  }
+  return refined;
+}
+
+}  // namespace
+
+void RefineResolutionsToData(EncodingInfo& info, ConstBufferView cloud_data) {
+  if (info.encoding_opt != EncodingOptions::LOSSY || info.point_step == 0) {
+    return;
+  }
+  for (auto& field : info.fields) {
+    const bool is_float = field.type == FieldType::FLOAT32 || field.type == FieldType::FLOAT64;
+    if (!is_float || !field.resolution || *field.resolution <= 0.0F ||
+        static_cast<uint64_t>(field.offset) + SizeOf(field.type) > info.point_step) {
+      continue;
+    }
+    field.resolution = refinedResolution(field, *field.resolution, cloud_data, info.point_step);
+  }
+}
+
 size_t MaxCompressedSize(const EncodingInfo& info, size_t points_count, bool include_header) {
   if (info.point_step == 0) {
     throw std::runtime_error("point_step cannot be 0");
@@ -275,7 +514,10 @@ size_t MaxCompressedSize(const EncodingInfo& info, size_t points_count, bool inc
     const size_t points_in_chunk = std::min(points_left, chunk_points);
     points_left -= points_in_chunk;
     size_t max_chunk_input_size = points_in_chunk * max_serialized_point_size;
-    if (detail::UsesV5Codec(info)) {
+    if (detail::UsesV6Codec(info)) {
+      // V6: section headers, the validity mask and the adaptive integer sections
+      max_chunk_input_size += info.fields.size() * 32u + 1024u + points_in_chunk / 8 + 64u;
+    } else if (detail::UsesV5Codec(info)) {
       // V5 adaptive integer sections add mode/header bytes. Adaptive sections
       // compete using their full encoded size, so any selected mode remains
       // bounded by the delta-varint section plus this fixed slack.
@@ -283,22 +525,7 @@ size_t MaxCompressedSize(const EncodingInfo& info, size_t points_count, bool inc
     }
 
     total_size += sizeof(uint32_t);  // chunk size prefix
-    switch (info.compression_opt) {
-      case CompressionOption::NONE:
-        total_size += max_chunk_input_size;
-        break;
-      case CompressionOption::LZ4:
-        if (max_chunk_input_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-          throw std::runtime_error("Chunk size too large for LZ4");
-        }
-        total_size += static_cast<size_t>(LZ4_compressBound(static_cast<int>(max_chunk_input_size)));
-        break;
-      case CompressionOption::ZSTD:
-        total_size += ZSTD_compressBound(max_chunk_input_size);
-        break;
-      default:
-        throw std::runtime_error("Unsupported compression option in MaxCompressedSize");
-    }
+    total_size += detail::CompressBound(info.compression_opt, max_chunk_input_size);
   }
 
   return total_size;
@@ -379,10 +606,13 @@ EncodingInfo DecodeHeader(ConstBufferView& input) {
   const uint8_t version = char_to_num(input.data()[0]) * 10 + char_to_num(input.data()[1]);
   input.trim_front(2);
 
-  if (version < 2 || version > kEncodingVersion) {
+  if (version > kMaxEncodingVersion) {
     throw std::runtime_error(
-        "Unsupported encoding version. Current is:" + std::to_string(kEncodingVersion) +
-        ", got: " + std::to_string(version));
+        "Cloudini encoding version " + std::to_string(version) + " is newer than this build reads (up to " +
+        std::to_string(kMaxEncodingVersion) + "): update Cloudini (library, ROS package or Foxglove extension)");
+  }
+  if (version < 2) {
+    throw std::runtime_error("Unsupported encoding version: " + std::to_string(version));
   }
   // Note: version 4 adds Gorilla bit-packing for lossless FLOAT32/FLOAT64 XOR residuals.
   // Versions 2 and 3 keep the raw-XOR path (8 bytes per double, 4 bytes per float).
@@ -399,8 +629,7 @@ EncodingInfo DecodeHeader(ConstBufferView& input) {
     yaml_str = yaml_str.substr(0, null_pos);
     input.trim_front(null_pos + 1);  // consume header + null terminator
     EncodingInfo yaml_header = EncodingInfoFromYAML(yaml_str);
-    // The magic-header version is authoritative. YAML's parseScalar<uint8_t> reads a
-    // single character (e.g. "3" -> 51), so the YAML-parsed info.version is unreliable.
+    // The magic-header version is authoritative.
     yaml_header.version = version;
     return yaml_header;
   }
@@ -441,15 +670,55 @@ EncodingInfo DecodeHeader(ConstBufferView& input) {
 }
 
 PointcloudEncoder::PointcloudEncoder(const EncodingInfo& info) : info_(info) {
+  // Same range as DecodeHeader: a version no decoder reads would only fail on the receiving side.
+  if (info_.version < 2 || info_.version > kMaxEncodingVersion) {
+    throw std::runtime_error(
+        "PointcloudEncoder: unsupported encoding version " + std::to_string(info_.version) + " (valid: 2 to " +
+        std::to_string(kMaxEncodingVersion) + ")");
+  }
+  // The field encoders read SizeOf(type) bytes at field.offset inside every point:
+  // a field that does not fit in point_step would read past the end of the cloud.
+  for (const auto& field : info_.fields) {
+    if (static_cast<uint64_t>(field.offset) + static_cast<uint64_t>(SizeOf(field.type)) > info_.point_step) {
+      throw std::runtime_error("PointcloudEncoder: field '" + field.name + "' does not fit in point_step");
+    }
+  }
   EncodeHeader(info_, header_);
 
-  if (!detail::UsesV5Codec(info_)) {
+  if (!detail::UsesV6Codec(info_) && !detail::UsesV5Codec(info_)) {
     detail::BuildV4Encoders(info_, encoders_);
   }
 
   if (info_.compression_opt != CompressionOption::NONE && info_.use_threads) {
     compressing_thread_ = std::thread(&PointcloudEncoder::compressionWorker, this);
   }
+}
+
+void PointcloudEncoder::setCloudSize(uint32_t width, uint32_t height) {
+  if (width == info_.width && height == info_.height) {
+    return;
+  }
+  info_.width = width;
+  info_.height = height;
+  header_.clear();
+  EncodeHeader(info_, header_);
+}
+
+PointcloudEncoder& PointcloudEncoderCache::get(const EncodingInfo& info) {
+  if (encoder_) {
+    const EncodingInfo& current = encoder_->getEncodingInfo();
+    EncodingInfo resized = info;
+    resized.width = current.width;
+    resized.height = current.height;
+    // operator== compares fields, sizes and options, not the version, the configuration or the threading
+    if (resized == current && info.version == current.version && info.encoding_config == current.encoding_config &&
+        info.use_threads == current.use_threads) {
+      encoder_->setCloudSize(info.width, info.height);
+      return *encoder_;
+    }
+  }
+  encoder_ = std::make_unique<PointcloudEncoder>(info);
+  return *encoder_;
 }
 
 PointcloudEncoder::~PointcloudEncoder() {
@@ -481,7 +750,8 @@ void PointcloudEncoder::compressionWorker() {
 
       ConstBufferView stage1_data(buffer_compressing_.get(), buffer_compressing_size_);
       BufferView compressed_output(output_view_.data(), output_view_.size());
-      const uint32_t chunk_size = detail::CompressChunk(info_.compression_opt, stage1_data, compressed_output);
+      const uint32_t chunk_size =
+          detail::CompressChunk(info_.compression_opt, stage1_data, compressed_output, block_starts_compressing_);
       output_view_ = compressed_output;
       memcpy(compressed_chunk_size_ptr, &chunk_size, sizeof(uint32_t));
 
@@ -520,15 +790,13 @@ size_t PointcloudEncoder::encode(ConstBufferView cloud_data, std::vector<uint8_t
   }
 
   const size_t points_count = cloud_data.size() / info_.point_step;
-  output.resize(MaxCompressedSize(info_, points_count, true));
-  // write the header
-  BufferView output_view(output.data(), output.size());
-  memcpy(output_view.data(), header_.data(), header_.size());
-  output_view.trim_front(header_.size());
-
-  const size_t added_bytes = encode(cloud_data, output_view, false);
-  const size_t new_size = header_.size() + added_bytes;
-  output.resize(new_size);
+  // Encode into a scratch buffer and copy out only the bytes produced: growing `output`
+  // to the worst-case bound would zero-fill a buffer 2-3x larger than the input on every call.
+  const size_t max_size = MaxCompressedSize(info_, points_count, false) + header_.size();
+  ensureScratchBuffer(output_scratch_, output_scratch_capacity_, max_size);
+  BufferView output_view(output_scratch_.get(), max_size);
+  const size_t new_size = encode(cloud_data, output_view, true);
+  output.assign(output_scratch_.get(), output_scratch_.get() + new_size);
   return new_size;
 }
 
@@ -582,16 +850,17 @@ size_t PointcloudEncoder::encode(ConstBufferView cloud_data, BufferView& output,
     output_view_.trim_front(header_.size());
   }
 
-  auto write_stage1_chunk = [&](size_t serialized_size) {
+  auto write_stage1_chunk = [&](size_t serialized_size, std::span<const size_t> block_starts) {
     ConstBufferView stage1_data(buffer_.get(), serialized_size);
     if (info_.compression_opt == CompressionOption::NONE || !info_.use_threads) {
-      compressed_size_ += detail::WriteStage1Chunk(info_, stage1_data, output_view_);
+      compressed_size_ += detail::WriteStage1Chunk(info_, stage1_data, output_view_, block_starts);
       return;
     }
     waitForCompressionComplete();
     {
       std::unique_lock<std::mutex> lock(mutex_);
       buffer_compressing_size_ = serialized_size;
+      block_starts_compressing_.assign(block_starts.begin(), block_starts.end());
       std::swap(buffer_, buffer_compressing_);
       std::swap(buffer_capacity_, buffer_compressing_capacity_);
       has_data_to_compress_ = true;
@@ -600,30 +869,34 @@ size_t PointcloudEncoder::encode(ConstBufferView cloud_data, BufferView& output,
     cv_ready_to_compress_.notify_one();
   };
 
-  if (detail::UsesV5Codec(info_)) {
-    const size_t stage_capacity = detail::V5StageBufferSize(info_, detail::kPointsPerChunk);
-    ensureScratchBuffer(buffer_, buffer_capacity_, stage_capacity);
-    if (info_.compression_opt != CompressionOption::NONE && info_.use_threads) {
-      ensureScratchBuffer(buffer_compressing_, buffer_compressing_capacity_, stage_capacity);
+  const bool v6 = detail::UsesV6Codec(info_);
+  const bool v5 = !v6 && detail::UsesV5Codec(info_);
+  const size_t stage_capacity =
+      v6   ? detail::V6StageBufferSize(info_, detail::kPointsPerChunk)
+      : v5 ? detail::V5StageBufferSize(info_, detail::kPointsPerChunk)
+           : detail::kPointsPerChunk * std::max<size_t>(info_.point_step, detail::MaxSerializedPointSize(info_));
+  ensureScratchBuffer(buffer_, buffer_capacity_, stage_capacity);
+  if (info_.compression_opt != CompressionOption::NONE && info_.use_threads) {
+    ensureScratchBuffer(buffer_compressing_, buffer_compressing_capacity_, stage_capacity);
+  }
+  auto get_stage_buffer = [this] { return BufferView(buffer_.get(), buffer_capacity_); };
+
+  if (v6) {
+    if (!v6_state_) {
+      v6_state_ = std::make_unique<detail::V6EncoderState>();
     }
-    auto get_stage_buffer = [this] { return BufferView(buffer_.get(), buffer_capacity_); };
+    detail::EncodeV6Stage1(
+        info_, *v6_state_, cloud_data, points_count, detail::kPointsPerChunk, get_stage_buffer, write_stage1_chunk);
+  } else if (v5) {
     detail::EncodeV5Stage1(
         info_, cloud_data, points_count, detail::kPointsPerChunk, get_stage_buffer, write_stage1_chunk);
   } else {
-    const size_t max_per_point = detail::MaxSerializedPointSize(info_);
-    const size_t stage_capacity =
-        detail::kPointsPerChunk * std::max<size_t>(info_.point_step, max_per_point);
-    ensureScratchBuffer(buffer_, buffer_capacity_, stage_capacity);
-    if (info_.compression_opt != CompressionOption::NONE && info_.use_threads) {
-      ensureScratchBuffer(buffer_compressing_, buffer_compressing_capacity_, stage_capacity);
-    }
-
     ConstBufferView remaining = cloud_data;
     while (!remaining.empty()) {
       BufferView stage_view(buffer_.get(), buffer_capacity_);
-      const size_t serialized_size = detail::EncodeV4Stage1Chunk(
-          info_, encoders_, remaining, detail::kPointsPerChunk, stage_view);
-      write_stage1_chunk(serialized_size);
+      const size_t serialized_size =
+          detail::EncodeV4Stage1Chunk(info_, encoders_, remaining, detail::kPointsPerChunk, stage_view);
+      write_stage1_chunk(serialized_size, {});
     }
   }
 
@@ -638,14 +911,60 @@ size_t PointcloudEncoder::encode(ConstBufferView cloud_data, BufferView& output,
 //------------------------------------------------------------------------------------------
 
 void PointcloudDecoder::updateDecoders(const EncodingInfo& info) {
-  if (detail::UsesV5Codec(info)) {
+  if (detail::UsesV6Codec(info)) {
+    detail::BuildV6Decoders(info, decoders_, min_encoded_point_bytes_);
+  } else if (detail::UsesV5Codec(info)) {
     detail::BuildV5Decoders(info, decoders_, min_encoded_point_bytes_);
   } else {
     detail::BuildV4Decoders(info, decoders_, min_encoded_point_bytes_);
   }
 }
 
+namespace {
+// Largest overhang (bytes past point_step) reproduced as older decoders did; see PointcloudDecoder::decode.
+constexpr uint64_t kMaxFieldOverhang = 4096;
+}  // namespace
+
 void PointcloudDecoder::decode(const EncodingInfo& info, ConstBufferView compressed_data, BufferView output) {
+  // The header comes from the message, and encoders before 1.3.1 accepted fields that do not fit in
+  // point_step (e.g. a FLOAT32 at offset 12 with point_step 14). The field decoders write SizeOf(type)
+  // bytes at field.offset in every point: such a field spills into the next point, which is decoded
+  // after it, and past the output buffer for the last point.
+  uint64_t overhang = 0;
+  for (const auto& field : info.fields) {
+    if (field.offset != kDecodeButSkipStore) {
+      const uint64_t end = static_cast<uint64_t>(field.offset) + static_cast<uint64_t>(SizeOf(field.type));
+      overhang = std::max(overhang, end > info.point_step ? end - info.point_step : 0);
+    }
+  }
+  if (overhang == 0) {
+    decodeImpl(info, compressed_data, output);
+    return;
+  }
+
+  const uint64_t cloud_size = static_cast<uint64_t>(info.width) * info.height * info.point_step;
+  if (overhang <= kMaxFieldOverhang && output.size() >= cloud_size) {
+    // Decode exactly as older decoders did (same writes, in the same order) into a buffer with room for
+    // the overhang of the last point, then keep the points: the output is the same as before, without
+    // writing past the caller's buffer.
+    std::vector<uint8_t> padded(static_cast<size_t>(cloud_size + overhang));
+    decodeImpl(info, compressed_data, BufferView(padded.data(), padded.size()));
+    memcpy(output.data(), padded.data(), static_cast<size_t>(cloud_size));
+    return;
+  }
+
+  // Otherwise (a corrupted or crafted header), such fields are decoded but not stored.
+  EncodingInfo in_bounds_info = info;
+  for (auto& field : in_bounds_info.fields) {
+    if (field.offset != kDecodeButSkipStore &&
+        static_cast<uint64_t>(field.offset) + static_cast<uint64_t>(SizeOf(field.type)) > info.point_step) {
+      field.offset = kDecodeButSkipStore;
+    }
+  }
+  decodeImpl(in_bounds_info, compressed_data, output);
+}
+
+void PointcloudDecoder::decodeImpl(const EncodingInfo& info, ConstBufferView compressed_data, BufferView output) {
   // read the header
   updateDecoders(info);
 
@@ -682,17 +1001,23 @@ void PointcloudDecoder::decode(const EncodingInfo& info, ConstBufferView compres
 
 void PointcloudDecoder::decodeChunk(
     const EncodingInfo& info, ConstBufferView chunk_data, BufferView& output_buffer, size_t expected_points) {
+  const size_t points_in_chunk =
+      expected_points != 0 ? expected_points : static_cast<size_t>(info.width) * static_cast<size_t>(info.height);
   const size_t max_decompressed_size =
-      static_cast<size_t>(info.width) * static_cast<size_t>(info.height) * info.point_step;
-  ConstBufferView encoded_view = detail::DecompressChunk(
-      info.compression_opt, chunk_data, decompressed_buffer_, max_decompressed_size);
+      detail::UsesV6Codec(info) ? detail::V6StageBufferSize(info, points_in_chunk)
+      : detail::UsesV5Codec(info)
+          ? detail::V5StageBufferSize(info, points_in_chunk)
+          : points_in_chunk * std::max<size_t>(info.point_step, detail::MaxSerializedPointSize(info));
+  ConstBufferView encoded_view =
+      detail::DecompressChunk(info.compression_opt, chunk_data, decompressed_buffer_, max_decompressed_size);
 
-  if (detail::UsesV5Codec(info)) {
+  if (detail::UsesV6Codec(info)) {
+    detail::DecodeV6Stage1Chunk(info, decoders_, encoded_view, output_buffer, expected_points);
+  } else if (detail::UsesV5Codec(info)) {
     detail::DecodeV5Stage1Chunk(info, decoders_, encoded_view, output_buffer, expected_points);
   } else {
     detail::DecodeV4Stage1Chunk(
-        decoders_, min_encoded_point_bytes_, encoded_view, output_buffer,
-        info.point_step, expected_points);
+        decoders_, min_encoded_point_bytes_, encoded_view, output_buffer, info.point_step, expected_points);
   }
 }
 

@@ -3,8 +3,10 @@ name: ROS2 Rolling
 on:
   push:
     branches: [ main ]
+    paths-ignore: ['**.md', '**.svg', '**.png', 'docs/**', 'LICENSE']
   pull_request:
     branches: [ main ]
+    paths-ignore: ['**.md', '**.svg', '**.png', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
 concurrency:
@@ -15,13 +17,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: rostooling/setup-ros-docker:ubuntu-noble-ros-rolling-ros-base-latest
+      image: rostooling/setup-ros-docker:ubuntu-resolute-ros-rolling-ros-base-latest
     steps:
       # action-ros-ci checks the repo out to its own ros_ws/src, not to
       # ${{ github.workspace }}. Do an explicit checkout first so the
       # .repos file passed to vcs-repo-file-url below is reachable.
       - uses: actions/checkout@v7
 
+      # Unlike the fixed distros, the Rolling image's rosdep index goes stale, so
+      # setup-ros must refresh it (without it rosdep can't resolve pcl_conversions etc.).
       - uses: ros-tooling/setup-ros@v0.7
         with:
           required-ros-distributions: rolling

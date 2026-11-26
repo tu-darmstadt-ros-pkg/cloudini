@@ -2,6 +2,268 @@
 Changelog for package cloudini_lib
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+1.5.0 (2026-11-20)
+------------------
+* perf: faster V6 encoder on x86 (`#170 <https://github.com/facontidavide/cloudini/issues/170>`_, `#172 <https://github.com/facontidavide/cloudini/issues/172>`_)
+
+  * Encoding takes 19% to 57% less time on nine sensor-like streams (single thread,
+    eight synthetic and the Hesai sample), with the same compressed size. The gain is
+    largest for clouds of x, y, z only and for clouds with integer fields.
+  * A block coder (SSE4.1) quantizes, predicts and writes x, y, z and the other float
+    columns four values at a time. Chunks that have points with some but not all axes
+    NaN, or values beyond 2^22 quantization steps, keep the previous coder. Same bytes.
+  * Integer fields whose coding mode is chosen are coded field by field in blocks,
+    pass-through fields are copied in one loop, and ``RefineResolutionsToData`` checks
+    FLOAT32 fields four values at a time. Same bytes.
+  * The encoder keeps the coding modes of the integer fields between the clouds of a
+    stream, as it does for the predictor and the mask kind. They are chosen again
+    every 16 clouds, and on the next cloud when a section comes out more than twice as
+    large as on the cloud they were chosen on. For clouds with integer fields the bytes
+    can differ from 1.4.1; the format does not change and decoders from 1.4.0 read it.
+  * ARM builds keep the previous coder for float columns; WebAssembly builds use the
+    block coder since they are built with WASM SIMD (`#176 <https://github.com/facontidavide/cloudini/issues/176>`_).
+* perf: faster V6 and V5 decoder on x86 (`#175 <https://github.com/facontidavide/cloudini/issues/175>`_)
+
+  * Decoding is 1.67x faster without stage-2 compression and 1.52x faster with ZSTD
+    (geometric mean of 13 sensors, single thread). Same decoded bytes.
+  * A block decoder (SSE4.1) unpacks up to four varints per byte shuffle, predicts x, y, z
+    as the lanes of one register and stores the floats in the same pass, 64 points at a
+    time; float columns and 16/32-bit delta-varint integer sections likewise. Chunks it
+    does not take (NaN markers, varints over 4 bytes, values of 2^29 quantization steps
+    or more) keep the previous decoder.
+  * Stage 2 decompresses into a buffer of the decoding thread instead of a new one per
+    message. A thread that decodes keeps up to about 10 MB of such buffers.
+* perf: the WebAssembly modules are built with WASM SIMD (`#176 <https://github.com/facontidavide/cloudini/issues/176>`_)
+
+  * The SSE4.1 block coders above run in WebAssembly too: decoding is 2.2x faster without
+    stage 2 and 1.9x faster with ZSTD than in a module built without SIMD (Node 22).
+  * Engines without WASM SIMD (Safari before 16.4) cannot load the module. Build with
+    ``-DCLOUDINI_WASM_SIMD=OFF`` for them.
+  * The release modules are built with Emscripten 7.0.0 instead of 3.1.51.
+* perf: faster single-field and lossless encoding/decoding (`#167 <https://github.com/facontidavide/cloudini/issues/167>`_)
+
+  * The codec is built with ``-O3`` in non-Debug builds. RelWithDebInfo, the default of
+    ROS/colcon builds, and distribution packages build with ``-O2``, where lossy float
+    fields decoded about 1.5x slower.
+  * Lossless fields, and lossy float fields without a resolution, are decoded in bulk:
+    a single-field cloud decodes 37x faster without compression and 2.4x faster with
+    ZSTD.
+  * New ``FieldEncoder::encodePoints()``, used for single-field clouds: with ZSTD, a
+    lossless float field encodes 2x faster and a lossy one 1.37x. Same bytes.
+* refactor: the PCL conversions are header-only and cloudini_lib no longer depends on
+  PCL (`#166 <https://github.com/facontidavide/cloudini/issues/166>`_)
+
+  * ``cloudini_lib/pcl_conversion.hpp`` keeps its API; code that includes it finds and
+    links PCL (``common`` and ``io``) itself.
+  * The library only depends on zstd, lz4 and threads. The ROS cloudini_lib package no
+    longer pulls libpcl-dev into every package that only needs the codec; PCL is a test
+    dependency.
+  * The conda package, built without PCL, now ships a usable ``pcl_conversion.hpp``.
+* fix: undefined behaviour in the integer delta encoders (`#171 <https://github.com/facontidavide/cloudini/issues/171>`_, `#173 <https://github.com/facontidavide/cloudini/issues/173>`_).
+  The difference of two 64-bit values was computed as an int64, which overflows for
+  INT64 / UINT64 fields with large jumps. It now wraps around, as in the decoders.
+  Same bytes.
+* fix: V6 with a resolution below 1 / FLT_MAX (about 2.9e-39). Its inverse is infinite
+  in float precision, and a 0 value could be quantized wrongly by the SSE path: it did
+  not decode as 0 (`#171 <https://github.com/facontidavide/cloudini/issues/171>`_)
+* fix: a header with a subnormal resolution could not be read by builds that use
+  libc++ (macOS, WebAssembly): "Failed to parse float value" (`#171 <https://github.com/facontidavide/cloudini/issues/171>`_)
+* fix: encoding through the WebAssembly API (``cldn_EncodePointcloudMessage``,
+  ``cldn_EncodePointcloudData``) aborted the module: the encoder tried to start a worker
+  thread, which a build without pthreads cannot. ``EncodingInfo::use_threads`` is now
+  false by default there (`#176 <https://github.com/facontidavide/cloudini/issues/176>`_)
+* fix: the Gorilla FLOAT64 decoder shifted out of range on corrupted input; it now rejects
+  it (`#175 <https://github.com/facontidavide/cloudini/issues/175>`_)
+* fix: ``cldn_EncodePointcloudData`` (WebAssembly) failed on every call: the version in the YAML
+  header was read as a character (``6`` -> 54). ``EncodingInfoFromYAML`` now reads it as a number.
+  The call also refines the resolutions to the data first, like the other encode paths (`#41 <https://github.com/facontidavide/cloudini/issues/41>`_)
+* feat: Python encoder ``cloudini_py/cloudini_encoder.py``: a structured NumPy array to a Cloudini
+  payload (a ``.cldn`` file, or the ``data`` of a CompressedPointCloud2), through the WebAssembly
+  module. ``CloudiniDecoder.decode_data`` reads such a payload back. The Python loader now lets the module's
+  memory grow (clouds over about 4 MB failed) and turns a C++ error into a ``RuntimeError`` (`#41 <https://github.com/facontidavide/cloudini/issues/41>`_)
+* fix: ``basic_types.hpp`` and ``intrinsics.hpp`` did not compile when included first (missing
+  ``<limits>`` and ``<cassert>``); ``pcl_conversion_impl.hpp`` lacked ``<map>``. The tests now
+  compile every public header on its own (`#169 <https://github.com/facontidavide/cloudini/issues/169>`_)
+* Contributors: Davide Faconti, Finn Weithoff, Jose Luis Blanco-Claraco
+
+1.4.1 (2026-09-29)
+------------------
+* fix: build with MSVC. The V6 encoder called the GCC/Clang builtin ``__builtin_clzll``;
+  it now uses ``std::countl_zero``. Output is unchanged.
+* ci: build and test the library with MSVC on Windows.
+
+1.4.0 (2026-09-28)
+------------------
+* feat: V6 wire format, now the default (`#150 <https://github.com/facontidavide/cloudini/issues/150>`_)
+
+  * V6 codes x, y, z as residual streams against a predictor chosen per chunk (previous
+    point, point K back, LOCO-I median of the two, second order), skips no-return points
+    with a validity mask, and gives every other float field its own stream. With ZSTD,
+    the median output is 13% smaller than V5 on 13 LiDAR/depth datasets.
+  * Encoders write V6 by default. Decoders from 1.3.1 and earlier cannot read it: select
+    version 5 for them (``--encoding-version 5``, ``encoding_version:=5``,
+    ``cloudini_encoding_version: 5``, or ``EncodingInfo::version = 5``).
+  * Resolutions are refined to the data by default (``RefineResolutionsToData``):
+    integer-valued floats such as intensity are stored at resolution 1, with the same
+    error bound. On a 2.8 GB warehouse bag, V6 with refinement is 24% smaller than 1.3.1
+    and decodes 1.75x faster. ``cloudini_rosbag_converter --no-refine`` turns it off.
+  * V5: adaptive integer sections sized for the stage-2 compressor (same format).
+  * Faster decode of V4, V5 and V6 (same bytes on the wire): up to +59% for V4 clouds
+    with integer fields.
+  * ``PointcloudEncoderCache`` keeps one encoder per stream (rosbag converter, topic
+    converter, point_cloud_transport plugin, ``SerializeCompressedPointCloud2``).
+  * Fixes: heap overflow on crafted V5 RLE runs; writes past the output for fields
+    beyond point_step; misaligned loads of packed fields; signed overflow on corrupted
+    input; encoding versions no decoder reads are rejected by the encoder.
+  * Tools: ``mcap_codec_benchmark`` V6 and V6-viz modes, ``--profile`` and
+    ``--no-refine``; ``cloudini_rosbag_converter --no-refine``, profile files read whole.
+* fix: a cloud from a newer Cloudini fails with an error that asks to update Cloudini
+  (library, ROS package or Foxglove extension), instead of "Unsupported encoding version"
+* fix: keep packed rgb/rgba FLOAT32 fields lossless (`#135 <https://github.com/facontidavide/cloudini/issues/135>`_) (`#146 <https://github.com/facontidavide/cloudini/issues/146>`_)
+  Some ROS drivers pack RGB(A) as uint32 bits reinterpreted into a FLOAT32
+  field named "rgb"/"rgba". Every path that assigned a default resolution
+  to FLOAT32 fields quantized these bits, destroying the colors.
+  Add Cloudini::isPackedColorField() / defaultFieldResolution() in
+  basic_types.hpp and use them in applyResolutionProfile, the PCL
+  ConvertToEncodingInfo, the WASM encode helpers and the ROS
+  ConvertToEncodingInfo. An explicit resolution profile entry still wins.
+  Decoding needs no change: resolution is stored in the header.
+  Claude-Session: https://claude.ai/code/session_01EAorWbhzp56yxAVUF7M3Dd
+  Co-authored-by: Claude <noreply@anthropic.com>
+* fix: parse/format header resolution locale-independently (`#123 <https://github.com/facontidavide/cloudini/issues/123>`_) (`#145 <https://github.com/facontidavide/cloudini/issues/145>`_)
+  The YAML header resolution was parsed with std::stof, which honors the C
+  locale: with a ',' decimal separator (e.g. de_DE.UTF-8) "0.001" was read
+  as 0 and FieldDecoderFloatN_Lossy threw during decoding. The writer used
+  an ostringstream, which follows the global C++ locale (std::locale::global)
+  and could emit "0,001" or grouped integers such as "1.234.567".
+  - EncodingInfoToYAML: imbue the stream with std::locale::classic() and
+  write resolutions with the shortest precision that round-trips exactly.
+  - EncodingInfoFromYAML: parse resolution with a classic-locale stream.
+  - YAML::Node::parseScalar: imbue std::locale::classic().
+  Streams are used instead of std::from_chars/to_chars for float because
+  those are not available on all supported standard libraries (older libc++).
+  Add regression tests that switch to a comma-decimal locale (C locale only,
+  and C + global C++ locale), skipped if no such locale is installed.
+  Claude-Session: https://claude.ai/code/session_01EAorWbhzp56yxAVUF7M3Dd
+  Co-authored-by: Claude <noreply@anthropic.com>
+* Contributors: Davide Faconti
+
+1.3.1 (2026-09-20)
+------------------
+* build: make cloudini_lib embeddable with add_subdirectory / FetchContent (`#142 <https://github.com/facontidavide/cloudini/issues/142>`_)
+  Reuses zstd/lz4 targets defined by a parent project, ignores an inherited ament_cmake,
+  and keeps the build type, tests, tools, benchmarks, PCL and install rules out of the
+  parent. New options CLOUDINI_WITH_PCL and CLOUDINI_INSTALL; cloudini::cloudini_lib is
+  always defined.
+* fix: link Threads::Threads (static consumers failed with undefined pthread_create)
+* fix: reject inconsistent point clouds; make ros_message_definitions.hpp includable twice (`#141 <https://github.com/facontidavide/cloudini/issues/141>`_)
+* The CMake project version now matches package.xml (it was left at 1.2.4 in 1.3.0)
+* Contributors: Davide Faconti
+
+1.3.0 (2026-09-20)
+------------------
+* feat(packaging): conda/pixi package for prefix.dev + conda-forge (`#133 <https://github.com/facontidavide/cloudini/issues/133>`_)
+  * feat(packaging): add conda/pixi package (prefix.dev + conda-forge)
+  Ship cloudini as a conda package (shared library + headers + CMake package
+  config + cloudini_rosbag_converter CLI), buildable with rattler-build and
+  publishable to prefix.dev and conda-forge.
+  Library/CMake changes to make it installable outside ament:
+  - install(EXPORT) + generated cloudini_libConfig.cmake for standalone builds,
+  so downstream can find_package(cloudini_lib) and link cloudini::cloudini_lib
+  - $ORIGIN/../lib install RPATH so installed executables locate the lib
+  - prefer shared zstd/lz4 variants when the library itself is shared
+  - find_or_download_zstd.cmake: accept conda's zstd::libzstd_shared / zstd::libzstd
+  (conda-forge ships no static zstd) instead of vendoring a copy
+  - find_or_download_mcap.cmake: -DMCAP_INCLUDE_DIR offline hook (no-network builds)
+  - pin mcap_converter STATIC so the CLI stays self-contained under BUILD_SHARED_LIBS=ON
+  conda/recipe.yaml is hermetic (no network at build): links conda zstd/lz4-c,
+  uses conda cxxopts, and consumes a pre-fetched mcap source. Same recipe serves
+  prefix.dev and conda-forge/staged-recipes. conda/RELEASING.md documents the
+  release + publish workflow.
+  Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+  * release: pin cloudini 1.2.4 source sha256
+  Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+  * fix(cmake): export static compression dependencies and test installed consumers
+  * docs(conda): update release validation and publishing guidance
+  * ci: test Pixi packages and replace Kilted with Lyrical
+  ---------
+  Co-authored-by: Claude Opus 4.8 <noreply@anthropic.com>
+* Regression test for decoder buffer sizing (`#139 <https://github.com/facontidavide/cloudini/issues/139>`_) + clang-format pass (`#140 <https://github.com/facontidavide/cloudini/issues/140>`_)
+  * test: regression for decoder buffer sizing with expanding stage-1 encoding
+  Single-chunk lossless cloud of incompressible FLOAT64/UINT32 data, whose
+  stage-1 encoding exceeds width*height*point_step. Fails with "LZ4
+  decompression failed" before 9765a54 (`#139 <https://github.com/facontidavide/cloudini/issues/139>`_).
+  Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+  * chore: apply clang-format repo-wide, skip vendored contrib in the hook
+  Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+  ---------
+  Co-authored-by: Claude Fable 5.1 <noreply@anthropic.com>
+* fix(PointcloudDecoder): improve max decompressed size calculation for chunk decoding
+* Fix license tags in package.xml
+  According to ros_license_toolkit[^1] license tags should be in SPDX
+  list of licenses. In case of claudini_ros, the license version was
+  missing and in case of claudini_lib, the license name was not "exact".
+  This commit changes the license tags to use SPDX license identifiers.
+  Note that it doesn't fix the failures reported in claudini_lib in the
+  output below:
+  [cloudini_ros]
+  git hash of (/home/src/github.com/facontidavide/cloudini): d202e5255d12519ff1f3db1dac4df3ca0e550ee7
+  SchemaCheck
+  SUCCESS Detected package.xml version 3, validation of scheme successful.
+  LicenseTagExistsCheck
+  SUCCESS Found licenses ['Apache']
+  LicenseTagIsInSpdxListCheck
+  WARNING Licenses ['Apache'] are not in SPDX list of licenses. Make sure to exactly match one of https://spdx.org/licenses/.
+  LicenseTextExistsCheck
+  WARNING Since they are not in the SPDX list, we can not check if these tags have the correct license text:
+  'Apache': License text file '../LICENSE' is of license Apache-2.0 but tag is Apache.
+  LicensesInCodeCheck
+  WARNING For the following files, please change the License Tag in the package file to SPDX format:
+  'include/cloudini_plugin/cloudini_publisher_plugin.hpp' is of Apache-2.0 but its Tag is Apache.
+  'include/cloudini_plugin/cloudini_subscriber_plugin.hpp' is of Apache-2.0 but its Tag is Apache.
+  'include/cloudini_ros/cloudini_subscriber_pcl.hpp' is of Apache-2.0 but its Tag is Apache.
+  'include/cloudini_ros/conversion_utils.hpp' is of Apache-2.0 but its Tag is Apache.
+  'src/cloudini_publisher_plugin.cpp' is of Apache-2.0 but its Tag is Apache.
+  'src/cloudini_subscriber_pcl.cpp' is of Apache-2.0 but its Tag is Apache.
+  'src/cloudini_subscriber_plugin.cpp' is of Apache-2.0 but its Tag is Apache.
+  'src/conversion_utils.cpp' is of Apache-2.0 but its Tag is Apache.
+  'src/plugin_manifest.cpp' is of Apache-2.0 but its Tag is Apache.
+  'src/topic_converter.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/draco_helper.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/draco_helper.hpp' is of Apache-2.0 but its Tag is Apache.
+  'test/rosbag_benchmark.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/test_cloudini_subscriber.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/test_direct_publisher.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/test_plugin_publisher.cpp' is of Apache-2.0 but its Tag is Apache.
+  'test/test_plugin_subscriber.cpp' is of Apache-2.0 but its Tag is Apache.
+  LicenseFilesReferencedCheck
+  SUCCESS All license declaration are referenced by a tag.
+  --------------------
+  [cloudini_lib]
+  git hash of (/home/src/github.com/facontidavide/cloudini): d202e5255d12519ff1f3db1dac4df3ca0e550ee7
+  SchemaCheck
+  SUCCESS Detected package.xml version 3, validation of scheme successful.
+  LicenseTagExistsCheck
+  SUCCESS Found licenses ['Apache 2.0']
+  LicenseTagIsInSpdxListCheck
+  WARNING Licenses ['Apache 2.0'] are not in SPDX list of licenses. Make sure to exactly match one of https://spdx.org/licenses/.
+  LicenseTextExistsCheck
+  WARNING Since they are not in the SPDX list, we can not check if these tags have the correct license text:
+  'Apache 2.0': License text file '../LICENSE' is of license Apache-2.0 but tag is Apache 2.0.
+  LicensesInCodeCheck
+  FAILURE
+  The following files contain licenses that are not covered by any license tag:
+  'benchmarks/pcd_benchmark.cpp': ['MIT']
+  'cmake/CPM.cmake': ['MIT']
+  'include/cloudini_lib/ros_message_definitions.hpp': ['BSD-3-Clause']
+  'include/cloudini_lib/contrib/ankerl/stl.h': ['MIT']
+  'include/cloudini_lib/contrib/ankerl/unordered_dense.h': ['MIT']
+  LicenseFilesReferencedCheck
+  SUCCESS All license declaration are referenced by a tag.
+  [^1]: https://github.com/boschresearch/ros_license_toolkit
+* Preserve the channel metadata
+* Contributors: Davide Faconti, Guillaume Doisy, Michal Sojka, Tony Najjar
+
 1.2.2 (2026-06-04)
 ------------------
 * fix(field_encoder): use C++20 [[likely]]/[[unlikely]] instead of __builtin_expect (enables MSVC)

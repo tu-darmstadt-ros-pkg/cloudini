@@ -1,9 +1,16 @@
 function(find_or_download_lz4 FORCE_VENDORED)
 
   if(NOT FORCE_VENDORED)
-    find_package(lz4 CONFIG QUIET)
-    if(NOT TARGET LZ4::lz4_static)
-      find_package(LZ4 QUIET)
+    # Same as for zstd: reuse targets a parent project already defined.
+    if(NOT TARGET LZ4::lz4_static AND NOT TARGET LZ4::lz4_shared)
+      find_package(lz4 CONFIG QUIET)
+      if(NOT TARGET LZ4::lz4_static)
+        find_package(LZ4 QUIET)
+      endif()
+    endif()
+    if(NOT TARGET LZ4::lz4_static AND TARGET LZ4::lz4_shared)
+      add_library(LZ4::lz4_static INTERFACE IMPORTED)
+      set_target_properties(LZ4::lz4_static PROPERTIES INTERFACE_LINK_LIBRARIES LZ4::lz4_shared)
     endif()
     # Fallback for systems without cmake config (e.g. Ubuntu Jammy liblz4-dev)
     if(NOT TARGET LZ4::lz4_static)
@@ -35,7 +42,7 @@ function(find_or_download_lz4 FORCE_VENDORED)
     # define a helper to build both static and shared variants
     add_library(lz4_static STATIC ${LZ4_SOURCES})
     set_property(TARGET lz4_static PROPERTY POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(lz4_static PUBLIC ${lz4_SOURCE_DIR}/lib)
+    target_include_directories(lz4_static PUBLIC $<BUILD_INTERFACE:${lz4_SOURCE_DIR}/lib>)
 
     add_library(LZ4::lz4_static INTERFACE IMPORTED)
       set_target_properties(LZ4::lz4_static PROPERTIES

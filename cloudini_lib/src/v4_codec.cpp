@@ -40,8 +40,7 @@ void BuildV4Encoders(const EncodingInfo& info, std::vector<std::unique_ptr<Field
 }
 
 void BuildV4Decoders(
-    const EncodingInfo& info, std::vector<std::unique_ptr<FieldDecoder>>& decoders,
-    size_t& min_encoded_point_bytes) {
+    const EncodingInfo& info, std::vector<std::unique_ptr<FieldDecoder>>& decoders, size_t& min_encoded_point_bytes) {
   decoders.clear();
   min_encoded_point_bytes = 0;
 
@@ -64,12 +63,19 @@ void BuildV4Decoders(
 }
 
 size_t EncodeV4Stage1Chunk(
-    const EncodingInfo& info, std::vector<std::unique_ptr<FieldEncoder>>& encoders,
-    ConstBufferView& cloud_data, size_t points_per_chunk, BufferView& output) {
+    const EncodingInfo& info, std::vector<std::unique_ptr<FieldEncoder>>& encoders, ConstBufferView& cloud_data,
+    size_t points_per_chunk, BufferView& output) {
   ResetEncoders(encoders);
 
   size_t points_in_current_chunk = 0;
   size_t serialized_size = 0;
+  if (encoders.size() == 1 && info.point_step > 0) {
+    // A single field: encode the whole chunk at once.
+    const size_t count = std::min(points_per_chunk, cloud_data.size() / info.point_step);
+    serialized_size += encoders.front()->encodePoints(cloud_data.data(), info.point_step, count, output);
+    cloud_data.trim_front(count * info.point_step);
+    points_in_current_chunk = count;
+  }
   while (!cloud_data.empty() && points_in_current_chunk < points_per_chunk) {
     for (auto& encoder : encoders) {
       serialized_size += encoder->encode(cloud_data, output);
@@ -83,9 +89,8 @@ size_t EncodeV4Stage1Chunk(
 }
 
 void DecodeV4Stage1Chunk(
-    std::vector<std::unique_ptr<FieldDecoder>>& decoders, size_t min_encoded_point_bytes,
-    ConstBufferView& encoded_view, BufferView& output_buffer, size_t point_step,
-    size_t expected_points) {
+    std::vector<std::unique_ptr<FieldDecoder>>& decoders, size_t min_encoded_point_bytes, ConstBufferView& encoded_view,
+    BufferView& output_buffer, size_t point_step, size_t expected_points) {
   ResetDecoders(decoders);
 
   auto decode_point = [&] {
@@ -100,12 +105,11 @@ void DecodeV4Stage1Chunk(
   };
 
   if (expected_points > 0) {
-    for (size_t p = 0; p < expected_points; ++p) {
-      if (encoded_view.size() < min_encoded_point_bytes) {
-        throw std::runtime_error("Truncated encoded data: not enough bytes for a complete point");
-      }
-      decode_point();
+    if (output_buffer.size() < expected_points * point_step) {
+      throw std::runtime_error("Output buffer is too small to hold the decoded data");
     }
+    DecodePoints(decoders, encoded_view, output_buffer.data(), point_step, expected_points);
+    output_buffer.trim_front(expected_points * point_step);
   } else {
     while (!encoded_view.empty()) {
       if (encoded_view.size() < min_encoded_point_bytes) {

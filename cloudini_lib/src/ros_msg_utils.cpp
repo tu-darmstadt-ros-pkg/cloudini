@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <vector>
 
 #include "cloudini_lib/contrib/ankerl/unordered_dense.h"
@@ -49,7 +50,6 @@ inline uint64_t packVoxelKey21(int32_t qx, int32_t qy, int32_t qz) {
 }
 
 }  // namespace
-
 
 void readPointCloud2MessageCommon(nanocdr::Decoder& cdr, RosPointCloud2& result) {
   //----- read the header -----
@@ -165,8 +165,9 @@ void convertCompressedCloudToPointCloud2(const RosPointCloud2& pc_info, std::vec
 }
 
 void convertPointCloud2ToCompressedCloud(
-    const RosPointCloud2& pc_info, const Cloudini::EncodingInfo& encoding_info,
-    std::vector<uint8_t>& compressed_dds_msg) {
+    const RosPointCloud2& pc_info, const Cloudini::EncodingInfo& requested_info,
+    std::vector<uint8_t>& compressed_dds_msg, Cloudini::PointcloudEncoderCache* encoder_cache,
+    bool refine_resolutions) {
   compressed_dds_msg.clear();
   nanocdr::Encoder cdr_encoder(pc_info.cdr_header, compressed_dds_msg);
   writePointCloudHeader(cdr_encoder, pc_info);
@@ -186,9 +187,23 @@ void convertPointCloud2ToCompressedCloud(
     return;
   }
 
-  if (encoding_info.point_step == 0) {
+  if (requested_info.point_step == 0) {
     throw std::runtime_error("convertPointCloud2ToCompressedCloud: point_step cannot be 0");
   }
+  // The header repeats width and height: if they disagree with the payload, the
+  // result cannot be decoded.
+  const uint64_t declared_size = uint64_t{pc_info.width} * pc_info.height * pc_info.point_step;
+  if (declared_size != pc_info.data.size()) {
+    throw std::runtime_error(
+        "convertPointCloud2ToCompressedCloud: width*height*point_step is " + std::to_string(declared_size) +
+        " but data has " + std::to_string(pc_info.data.size()) + " bytes");
+  }
+  // Integer-valued floats (e.g. intensity) coded at resolution 1: smaller and faster, same error bound.
+  Cloudini::EncodingInfo encoding_info = requested_info;
+  if (refine_resolutions) {
+    Cloudini::RefineResolutionsToData(encoding_info, pc_info.data);
+  }
+
   // Derive point count from actual data size rather than trusting metadata width*height,
   // which could be maliciously large and cause excessive allocation.
   const size_t points_count = pc_info.data.size() / encoding_info.point_step;
@@ -198,7 +213,9 @@ void convertPointCloud2ToCompressedCloud(
 
   Cloudini::BufferView compressed_data_view(
       compressed_dds_msg.data() + prev_size, compressed_dds_msg.size() - prev_size);
-  Cloudini::PointcloudEncoder cloud_encoder(encoding_info);
+  std::optional<Cloudini::PointcloudEncoder> local_encoder;
+  Cloudini::PointcloudEncoder& cloud_encoder =
+      encoder_cache ? encoder_cache->get(encoding_info) : local_encoder.emplace(encoding_info);
   const size_t compressed_size = cloud_encoder.encode(pc_info.data, compressed_data_view, true);
 
   // we can finally write the actual size of the compressed data
@@ -231,9 +248,10 @@ void applyResolutionProfile(
     auto profile_it = profile.find(field.name);
     if (profile_it != profile.end()) {
       field.resolution = profile_it->second;
-    } else if (
-        default_resolution && field.type == Cloudini::FieldType::FLOAT32 && !Cloudini::isPackedColorField(field)) {
-      field.resolution = *default_resolution;
+    } else if (auto res = Cloudini::defaultFieldResolution(field, default_resolution)) {
+      // FLOAT32 fields get the default resolution, except packed colors ("rgb", "rgba"),
+      // which contain integer bits and must stay lossless.
+      field.resolution = *res;
     }
   }
 }
@@ -257,11 +275,9 @@ void applyVizLossyPreprocessing(RosPointCloud2& pc_info) {
   const auto& f2 = pc_info.fields[2];
   const bool has_triple =
       f0.type == Cloudini::FieldType::FLOAT32 && f1.type == Cloudini::FieldType::FLOAT32 &&
-      f2.type == Cloudini::FieldType::FLOAT32 && f0.resolution.has_value() &&
-      f1.resolution.has_value() && f2.resolution.has_value() &&
-      f0.resolution.value() == f1.resolution.value() &&
-      f0.resolution.value() == f2.resolution.value() &&
-      f1.offset == f0.offset + 4u && f2.offset == f0.offset + 8u;
+      f2.type == Cloudini::FieldType::FLOAT32 && f0.resolution.has_value() && f1.resolution.has_value() &&
+      f2.resolution.has_value() && f0.resolution.value() == f1.resolution.value() &&
+      f0.resolution.value() == f2.resolution.value() && f1.offset == f0.offset + 4u && f2.offset == f0.offset + 8u;
   if (!has_triple) {
     return;
   }
@@ -313,8 +329,7 @@ void applyVizLossyPreprocessing(RosPointCloud2& pc_info) {
       continue;  // drop NaN/inf
     }
     const uint64_t key = packVoxelKey21(
-        static_cast<int32_t>(std::lround(fx * inv_res)),
-        static_cast<int32_t>(std::lround(fy * inv_res)),
+        static_cast<int32_t>(std::lround(fx * inv_res)), static_cast<int32_t>(std::lround(fy * inv_res)),
         static_cast<int32_t>(std::lround(fz * inv_res)));
     if (!seen.insert(key).second) {
       continue;  // voxel duplicate
@@ -327,8 +342,7 @@ void applyVizLossyPreprocessing(RosPointCloud2& pc_info) {
 
   // Replace pc_info's data view with the new owned buffer.
   pc_info.owned_data = std::move(out);
-  pc_info.data =
-      Cloudini::ConstBufferView(pc_info.owned_data.data(), pc_info.owned_data.size());
+  pc_info.data = Cloudini::ConstBufferView(pc_info.owned_data.data(), pc_info.owned_data.size());
   pc_info.width = static_cast<uint32_t>(kept);
   pc_info.height = 1;
   pc_info.row_step = pc_info.point_step * pc_info.width;

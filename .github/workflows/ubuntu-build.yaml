@@ -3,8 +3,10 @@ name: Ubuntu Build & Test
 on:
   push:
     branches: [ main ]
+    paths-ignore: ['**.md', '**.svg', '**.png', 'docs/**', 'LICENSE']
   pull_request:
     branches: [ main ]
+    paths-ignore: ['**.md', '**.svg', '**.png', 'docs/**', 'LICENSE']
   workflow_dispatch:
 
 concurrency:
@@ -14,6 +16,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # CMake reads these for every configure below, including the install matrix.
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
     steps:
       - uses: actions/checkout@v7
@@ -24,15 +30,9 @@ jobs:
           packages: git cmake liblz4-dev libzstd-dev libgtest-dev
           version: 1.0
 
-      - name: Cache CMake files
-        uses: actions/cache@v6
+      - uses: hendrikmuhs/ccache-action@v1.2
         with:
-          path: |
-            ~/.cache/cmake
-            build
-          key: ${{ runner.os }}-cmake-${{ hashFiles('**/CMakeLists.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-cmake-
+          key: ${{ github.workflow }}
 
       - name: Configure
         run: |
@@ -47,3 +47,34 @@ jobs:
       - name: Run tests
         working-directory: build
         run: ctest --output-on-failure
+
+      - name: Test embedding as a subproject
+        run: |
+          cmake -S cloudini_lib/test/subproject -B "$RUNNER_TEMP/subproject"
+          cmake --build "$RUNNER_TEMP/subproject" -j$(nproc)
+          "$RUNNER_TEMP/subproject/consumer"
+          cmake --install "$RUNNER_TEMP/subproject" --prefix "$RUNNER_TEMP/subproject-prefix"
+          if find "$RUNNER_TEMP/subproject-prefix" -iname '*cloudini*' | grep -q .; then
+            echo "embedded Cloudini added install rules to the parent project"; exit 1
+          fi
+
+      - name: Test installed static and shared packages
+        shell: bash
+        run: |
+          for shared in OFF ON; do
+            for vendored in OFF ON; do
+              build_dir="$RUNNER_TEMP/install-test-$shared-$vendored"
+              cmake -S cloudini_lib -B "$build_dir" \
+                -DBUILD_SHARED_LIBS="$shared" -DCLOUDINI_FORCE_VENDORED_DEPS="$vendored" \
+                -DCLOUDINI_BUILD_TOOLS=OFF -DCLOUDINI_BUILD_BENCHMARKS=OFF \
+                -DBUILD_TESTING=OFF -DCMAKE_DISABLE_FIND_PACKAGE_PCL=TRUE \
+                -DCMAKE_INSTALL_PREFIX="$build_dir/prefix"
+              cmake --build "$build_dir" --parallel "$(nproc)"
+              cmake --install "$build_dir"
+              mv "$build_dir/prefix" "$build_dir/relocated"
+              cmake -S cloudini_lib/test/install -B "$build_dir/consumer" \
+                -DCMAKE_PREFIX_PATH="$build_dir/relocated"
+              cmake --build "$build_dir/consumer"
+              ctest --test-dir "$build_dir/consumer" --output-on-failure
+            done
+          done

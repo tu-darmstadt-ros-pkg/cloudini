@@ -8,11 +8,13 @@ Cloudini is a high-performance pointcloud compression library with bindings for 
 
 ## Architecture
 
-The project consists of three main components:
+The project consists of these components:
 
-- **cloudini_lib/**: Core compression library (C++20) with field encoders/decoders
+- **cloudini_lib/**: Core compression library (C++20) with field encoders/decoders, the tools, and the WebAssembly bindings (`src/wasm_functions.cpp`)
 - **cloudini_ros/**: ROS2 integration with point_cloud_transport plugins and conversion utilities
-- **cloudini_web/**: WebAssembly interface for browser-based compression
+- **cloudini_foxglove/**: Foxglove extension (`.foxe`) that decodes CompressedPointCloud2 through the WASM module; published in the Foxglove extension registry
+- **cloudini_py/**: Python decoder and encoder that load the WASM module through wasmtime
+- **cloudini_web/**: browser demo, unmaintained since 2025-07 and no longer hosted; not mentioned in the README
 
 ### Core Library (cloudini_lib)
 
@@ -61,7 +63,8 @@ Key components:
 - `convertCompressedCloudToPointCloud2()`: Decompress + convert
 - `toEncodingInfo()`: Extract encoding metadata from point cloud
 
-**PCL Integration** (`cloudini_lib/include/cloudini_lib/pcl_conversion.hpp`):
+**PCL Integration** (`cloudini_lib/include/cloudini_lib/pcl_conversion.hpp`, header-only, so
+`cloudini_lib` does not depend on PCL; code including it must find and link PCL `common` and `io`):
 - `PCLPointCloudEncode()`: Encode `pcl::PCLPointCloud2` to Cloudini format
 - `PCLPointCloudDecode()`: Decode Cloudini format to `pcl::PCLPointCloud2`
 - Direct conversion without intermediate ROS message types
@@ -91,14 +94,10 @@ colcon build --packages-select cloudini_lib cloudini_ros
 cmake -B build_wasm -S cloudini_lib -DCMAKE_TOOLCHAIN_FILE=$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake
 cmake --build build_wasm
 ```
+The WASM build uses WASM SIMD (`-msimd128 -msse4.1` on every target, `CLOUDINI_WASM_SIMD=ON`): Emscripten translates
+the SSE4.1 block codecs, about 2.2x faster decode without stage 2 and 1.9x with ZSTD (Node 22, 13 datasets).
+Engines without WASM SIMD (Safari before 16.4) cannot load that module; build with `-DCLOUDINI_WASM_SIMD=OFF` for them.
 
-### Web Interface
-```bash
-cd cloudini_web
-npm install
-npm run dev  # Development server
-npm run build  # Production build
-```
 
 ## Testing
 
@@ -144,6 +143,8 @@ ros2 run cloudini_ros cloudini_topic_converter --ros-args \
   -p topic_output:=/points/compressed \
   -p resolution:=0.001
 
+# Writes V6 by default; add -p encoding_version:=5 for readers on 1.3.1 or earlier
+
 # Decompress: CompressedPointCloud2 -> sensor_msgs/PointCloud2
 ros2 run cloudini_ros cloudini_topic_converter --ros-args \
   -p compressing:=false \
@@ -177,6 +178,16 @@ ros2 run cloudini_ros test_direct_publisher --ros-args \
 # Roughly halves output size on real LIDAR with stage-2 ZSTD.
 ./build_release/tools/cloudini_rosbag_converter -c -y --viz -f DATA/my_bag/
 
+# Default: V6, resolutions refined to the data of each cloud (integer-valued
+# floats such as intensity at resolution 1). For readers on 1.3.1 or earlier:
+./build_release/tools/cloudini_rosbag_converter -c -y --encoding-version 5 -f DATA/my_bag/
+
+# Keep the given resolutions (no refinement)
+./build_release/tools/cloudini_rosbag_converter -c -y --no-refine -f DATA/my_bag/
+
+# Per-field resolutions: a string or a file that contains it
+./build_release/tools/cloudini_rosbag_converter -c -y --profile "xyz:0.001; intensity:0.1; ring:remove" -f DATA/my_bag/
+
 # Decode back to PointCloud2
 ./build_release/tools/cloudini_rosbag_converter -d -y -f DATA/my_bag_encoded/
 ```
@@ -184,17 +195,17 @@ ros2 run cloudini_ros test_direct_publisher --ros-args \
 **Visualization workflow (`--viz`)**:
 
 The `--viz` flag bundles three lossy preprocessing operations applied per
-message before V4 encoding:
+message before encoding:
 1. Drop points whose geometry triple (xyz) contains NaN/inf.
 2. Voxel-dedupe at the xyz resolution (default 1mm). Hash-based,
    order-preserving — first occurrence of each voxel wins.
 3. Quantize FLOAT64 fields without an explicit resolution to 1µs (typically
    per-point timestamps stored as seconds-since-epoch).
 
-The wire format produced is plain V4 — any standard `mcap` / ROS2 consumer
-reads it without changes. The flag is for compression workflows where the
+The wire format is the selected version (V6 by default), so any Cloudini decoder
+of that version reads it without changes. The flag is for compression workflows where the
 original NaN/duplicate/sub-µs-precision data isn't needed by downstream
-visualizers. Empirical results on real LIDAR bags: ratio drops from ~30-40%
+visualizers. Empirical results on real LIDAR bags (measured with V4): ratio drops from ~30-40%
 (V4 lossless) to ~13-30% codec-only, ~15-17% after stage-2 ZSTD.
 
 Implementation: `cloudini_ros::applyVizLossyPreprocessing` in
@@ -202,7 +213,7 @@ Implementation: `cloudini_ros::applyVizLossyPreprocessing` in
 
 **Codec benchmark**:
 ```bash
-# Per-topic ratio + encode/decode speed for V4 vs V4+viz
+# Per-topic ratio + encode/decode speed for V4/V5/V6 and their viz variants
 ./build_release/tools/mcap_codec_benchmark DATA/my_bag.mcap --max-messages 100
 
 # Add --zstd for after-ZSTD-3 sizes (production-equivalent)
@@ -211,7 +222,40 @@ Implementation: `cloudini_ros::applyVizLossyPreprocessing` in
 # --explain prints field schema + viz-preprocessing effect for the first
 # message of each topic (NaN count, dedup count, FLOAT64 fields quantized)
 ./build_release/tools/mcap_codec_benchmark DATA/my_bag.mcap --explain
+
+# One variant only: --mode V4 | V5 | V6 | V4-viz | V5-viz | V6-viz
+./build_release/tools/mcap_codec_benchmark DATA/my_bag.mcap --mode V6 --zstd
+
+# Same per-field profile syntax as the converter (string or file)
+./build_release/tools/mcap_codec_benchmark DATA/my_bag.mcap --profile "xyz:0.001; intensity:1"
 ```
+V4, V5 and their viz variants run as in 1.2.1, without the optimizations added
+since: a new encoder per message and the given resolutions. The V6 variants use
+them: one encoder per topic across messages (`PointcloudEncoderCache`), and
+resolutions refined to each message's data first (`RefineResolutionsToData`:
+integer-valued floats such as intensity at resolution 1), counted in the encode
+time; `--no-refine` turns the refinement off.
+
+**Comparing released versions on an MCAP** (e.g. "benchmark 1.2.1, 1.3.1 and
+V6"): every version since 1.2.1 ships `mcap_codec_benchmark` with the same
+options, so measure each version with its own tool, built from a worktree of
+the tag. Don't write a separate harness.
+```bash
+git worktree add --detach .worktrees/tag-1.3.1 1.3.1
+cmake -B .worktrees/tag-1.3.1/build_release -S .worktrees/tag-1.3.1/cloudini_lib -DCMAKE_BUILD_TYPE=Release
+cmake --build .worktrees/tag-1.3.1/build_release --target mcap_codec_benchmark
+.worktrees/tag-1.3.1/build_release/tools/mcap_codec_benchmark my.mcap --mode V5 --zstd
+./build_release/tools/mcap_codec_benchmark my.mcap --mode V6 --zstd
+```
+- 1.2.1 and 1.3.1 know only the V4/V5 modes; V5 is their default and already
+  the adaptive-integer V5 of today (not the archived bit-packed "V5", see the
+  naming note below). The current branch writes the same V5 format, with
+  encoder choices tuned for stage 2 and a faster decoder.
+- The tags neither refine nor reuse encoders (a new encoder per message), like
+  the V4/V5 modes of the current tool. For a like-for-like comparison of the
+  codecs, also run V6 with `--no-refine`.
+- Pin timing runs to fixed cores (`taskset -c ...`) and check the machine is
+  idle: other jobs make the numbers vary by 10-30%.
 
 **V5 naming note**: A previous research branch
 (`feat/lossy-v2-bitpacked-default`, git tag `v5-reference-2026-05`) used "V5"
@@ -221,6 +265,39 @@ the V4 float paths and adds adaptive integer sections per chunk: integer fields
 can choose V4 delta-varint, palette indexes, raw-value RLE, or Delta-RLE
 for repeated increments. Use
 `mcap_codec_benchmark` to compare V4/V5 and V4-viz/V5-viz.
+
+**V6 (the default)**: encoders write V6 (`kEncodingVersion = 6`); decoders
+from 1.3.1 and earlier cannot read it, so select version 5 to write for them.
+Every encode path that derives the resolutions from the cloud (the ROS
+conversion helpers, the rosbag and topic converters, the point_cloud_transport
+plugin, the PCL conversion and the WebAssembly bindings) also refines them to
+the data first (`RefineResolutionsToData`); the rosbag converter's
+`--no-refine` turns it off. V6 keeps the V5 integer
+sections and codes x, y, z per chunk as three residual streams against a
+predictor chosen per chunk (previous point, point K back, LOCO-I median of
+the two, or second order; K = row width for organized clouds, detected
+otherwise), with an optional validity mask for NaN or all-zero points. Other
+FLOAT32 fields with a resolution get their own residual stream. The layout
+is used only when x, y, z are the first three FLOAT32 fields with a
+resolution in (0, 1e18); other version-6 clouds use the V5 layout. The
+encoder caches lag, predictor and mask kind per cloud size, and the coding modes
+of the integer fields (re-probed every 16 clouds, also across clouds of different
+size) and quantizes and codes with SSE4.1, 4 values per step; the first encode
+probes a prefix of each chunk, then codes it the same way. With SSE4.1 the decoder works in blocks too
+(`cloudini_lib/src/varint_block.hpp`): it unpacks up to 4 varints per byte shuffle (3 streams or 4 chains of
+one stream in the same loop), predicts x, y, z as the lanes of one register and stores the floats in the same
+pass, 64 points at a time; float columns and 16/32-bit delta-varint integer sections likewise. Chunks it does
+not take (NaN markers, varints over 4 bytes, values of 2^29 steps or more) go to the per-point decoder, with
+the same output. Keep one encoder per stream to benefit: `Cloudini::PointcloudEncoderCache`
+(used by the rosbag converter, `mcap_codec_benchmark`, the topic converter and
+the point_cloud_transport plugin). Selecting V5 instead: `--encoding-version 5`
+(rosbag converter), `encoding_version:=5` (topic converter),
+`cloudini_encoding_version: 5` (plugin), or the `encoding_version` argument of
+`SerializeCompressedPointCloud2`. Code: `cloudini_lib/src/v6_codec.cpp` (uses the
+V5 integer sections through `AdaptiveIntSectionsEncoder` in `v5_codec.hpp`);
+tests in `cloudini_lib/test/test_v6.cpp` (including a mutation test of corrupted
+V4/V5/V6 payloads; set `CLOUDINI_FUZZ_ITERATIONS` for longer runs under
+ASan/UBSan). Format reference with measurements: `docs/v6_format.html`.
 
 ### Debugging with ROS2 CLI
 
@@ -507,7 +584,7 @@ void MyNode::init() {
 
 **Cause**: Data race or lost notification in multi-threaded compression worker.
 
-**Fix**: Ensure all modifications to `compression_done_` and `compressed_size_` are protected by mutex. Fixed in recent commit to `cloudini_lib/src/cloudini.cpp`.
+**Fix**: Ensure all modifications to `compression_done_` and `compressed_size_` are protected by mutex (see Threading Safety Guidelines).
 
 ### Issue: Point cloud transport subscriber not receiving messages
 
@@ -549,10 +626,23 @@ Use correct type string:
 
 ## Tools
 
-- **cloudini_rosbag_converter**: Convert MCAP rosbags between compressed/uncompressed pointclouds. Accepts bag directories or bare `.mcap` files; generates a transformed `metadata.yaml` when one is present
+- **cloudini_rosbag_converter**: Convert MCAP rosbags between compressed/uncompressed pointclouds. Accepts bag directories or bare `.mcap` files; generates a transformed `metadata.yaml` when one is present. Released as a Linux AppImage
+- **mcap_codec_benchmark**: Per-topic ratio and speed of V4/V5/V6 on an MCAP (see Benchmarking)
 - **mcap_cutter**: Extract portions of MCAP files
-- **pcd_benchmark**: Benchmark compression on PCD files
-- **run_encoder.sh**: Batch processing script for test data
+- **mcap_header_inspector**: Print the Cloudini headers of the clouds in an MCAP
+- **pcd_to_cloudini_converter**: Encode a PCD file
+- **pcd_benchmark** (`cloudini_lib/benchmarks`): Benchmark compression on PCD files
+- **scripts/regenerate_readme_plots.py**: Regenerate the README charts (see below)
+
+### README charts
+
+`compression_ratio.svg` and `compression_speed.svg` compare Cloudini with the defaults (V6, 1 mm,
+refined, ZSTD) against ZSTD level 1 on the raw cloud, per sensor. Regenerate them with
+`python3 scripts/regenerate_readme_plots.py --cpu 8` after building `build_release`: it builds
+`scripts/readme_bench.cpp`, runs it twice pinned to one core, and writes both SVGs (light/dark via
+`prefers-color-scheme`). The clouds are raw frames in `DATA/v6_bench/<id>/` (`frame_*.bin` + `meta.json`;
+local only, not in git) plus the Hesai sample in `cloudini_lib/samples`. Sensor labels are in the
+script's `ROWS`. If the numbers change, update the ranges quoted in the README text as well.
 
 ## File Structure Reference
 
@@ -564,19 +654,29 @@ include/cloudini_lib/
 ├── field_encoder.hpp         # Field-specific encoder implementations
 ├── field_decoder.hpp         # Field-specific decoder implementations
 ├── intrinsics.hpp            # SIMD intrinsics wrappers (Vector4f, Vector4i)
-├── pcl_conversion.hpp        # PCL ↔ Cloudini conversion
+├── pcl_conversion.hpp        # PCL ↔ Cloudini conversion (header-only)
+├── pcl_conversion_impl.hpp   # Its implementation
 └── ros_msg_utils.hpp         # ROS2 message parsing/conversion utilities
 
 src/
-├── cloudini.cpp              # PointcloudEncoder/Decoder implementation
+├── cloudini.cpp              # PointcloudEncoder/Decoder implementation, header
+├── codec_common.cpp          # LZ4/ZSTD stage, shared helpers
+├── chunk_writer.cpp          # Chunked output
+├── v4_codec.cpp              # V4 point-by-point codec
+├── v5_codec.cpp              # V5 adaptive integer sections
+├── v6_codec.cpp              # V6 residual streams (see docs/v6_format.html)
+├── varint_block.hpp          # SSE4.1 block varint unpacking used by the V5/V6 decoders
 ├── field_encoder.cpp         # Encoder implementations (FloatN, Int, XOR)
 ├── field_decoder.cpp         # Decoder implementations
-├── pcl_conversion.cpp        # PCL integration
-└── ros_msg_utils.cpp         # ROS message utilities
+├── ros_msg_utils.cpp         # ROS message utilities
+└── wasm_functions.cpp        # WebAssembly exports (cldn_*)
 
-tools/
-├── cloudini_rosbag_converter # MCAP conversion tool
-└── mcap_cutter              # MCAP slicing utility
+tools/src/
+├── cloudini_rosbag_converter.cpp  # MCAP conversion tool (AppImage)
+├── mcap_codec_benchmark.cpp       # V4/V5/V6 benchmark on MCAP
+├── mcap_cutter.cpp                # MCAP slicing utility
+├── mcap_header_inspector.cpp      # Cloudini headers in an MCAP
+└── pcd_to_cloudini_converter.cpp  # PCD encoder
 ```
 
 ### cloudini_ros/
@@ -617,16 +717,17 @@ test/
 
 ### QoS Profile Auto-Detection
 
-`topic_converter.cpp` uses `adapt_request_to_offers()` to auto-detect publisher QoS:
+`topic_converter.cpp` uses `adapt_request_to_offers()` to auto-detect publisher QoS. It subscribes only once
+the input topic has a publisher, checks the publishers every 0.5 s and subscribes again when the QoS they offer
+changes (#158); the output publisher keeps the QoS of the first subscription:
 - **Reliability**: Uses RELIABLE if all publishers are RELIABLE, else BEST_EFFORT
 - **Durability**: Uses TRANSIENT_LOCAL if all publishers are TRANSIENT_LOCAL (for latched topics), else VOLATILE
 
 ### Typical Compression Ratios
 
-Based on empirical data:
-- **Lossy (1mm resolution)**: 5-10x compression
-- **Lossless**: 2-4x compression
-- **Depends on**: Point cloud structure, field types, data entropy
+With the defaults (V6, 1 mm, refined, ZSTD) on 13 sensors, the output is 2.8-34% of the raw cloud
+(Ouster 5-15%, Velodyne HDL 19%), 1.7-5.2x smaller than ZSTD alone. Numbers per sensor: the README charts.
+Depends on point cloud structure, field types and data entropy.
 
 ### Message Flow Diagram
 
@@ -696,10 +797,19 @@ Alternative (Manual Conversion):
 4. **Use ZSTD for maximum compression** (slower), **LZ4 for real-time** (faster)
 5. **Monitor with** `ros2 topic hz` and `ros2 topic bw` to verify compression gains
 
-## Recent Fixes (as of 2025)
+## Releasing
 
-- **Threading fix in PointcloudEncoder**: Protected `compression_done_` and `compressed_size_` with mutex to prevent data races and deadlocks
-- **Object pool optimization**: Added to CloudiniSubscriberPCL for ~75% allocation reduction
-- **Subscriber-aware processing**: topic_converter now skips processing when no subscribers present
-- **QoS auto-detection**: topic_converter automatically adapts to publisher QoS settings
-- **pcl_conversions linking**: Added to CMakeLists.txt for proper PCL integration
+A release touches several channels; do them in this order.
+1. Bump the version in `cloudini_lib/package.xml`, `cloudini_ros/package.xml`, `cloudini_lib/CMakeLists.txt`
+   (`project(... VERSION)`), `conda/recipe.yaml` and `cloudini_foxglove/package.json` (+ lock), and add the
+   entries to `cloudini_lib/CHANGELOG.rst`, `cloudini_ros/CHANGELOG.rst` and `cloudini_foxglove/CHANGELOG.md`.
+2. Tag on main (lightweight tag, e.g. `1.4.0`). The tag runs `.github/workflows/release-appimage.yaml`: the
+   GitHub release gets the AppImage, the WASM zip and the `.foxe`.
+3. After the tag: put the sha256 of the GitHub tarball in `conda/recipe.yaml` (follow-up PR).
+4. Foxglove extension registry (`foxglove/extension-registry`, entry `facontidavide.cloudini-converter`):
+   version, `.foxe` URL from the release and its sha256.
+5. Conan Center Index (`recipes/cloudini`): add the version to `config.yml` and `all/conandata.yml`.
+6. conda-forge: recipe from `conda/` (staged-recipes until the feedstock exists).
+7. ROS: `bloom-release --rosdistro <distro> --track <distro> cloudini` for humble, jazzy, kilted, lyrical and
+   rolling (release repo `facontidavide/cloudini-release`). Bloom can stop at interactive prompts (e.g. updating
+   old track actions) that need a TTY, so the maintainer runs it.

@@ -1,16 +1,46 @@
 cmake_minimum_required(VERSION 3.16)
-project(cloudini_lib)
+# NOTE: keep the default languages (C and CXX). The vendored zstd/lz4 fallback
+# compiles .c sources, so restricting to CXX only would break standalone builds.
+project(cloudini_lib VERSION 1.5.0)
+
+# When another project embeds this one (add_subdirectory / FetchContent), build
+# only the library: no forced build type, no ament packaging, no tests, tools,
+# benchmarks, PCL or install rules unless the parent asks for them.
+# (PROJECT_IS_TOP_LEVEL needs CMake 3.21.)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(CLOUDINI_IS_TOP_LEVEL ON)
+else()
+  set(CLOUDINI_IS_TOP_LEVEL OFF)
+endif()
+
+# Make installed executables relocatable: find the co-installed shared library
+# through an $ORIGIN-relative RPATH (bin/ -> ../lib). conda/conda-forge tooling
+# manages RPATHs on its own, so this mainly benefits a plain `cmake --install`.
+if(APPLE)
+  set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
+else()
+  set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+endif()
 
 # If not specified, set the default build type to Release
-if (NOT CMAKE_BUILD_TYPE)
+if (CLOUDINI_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE)
   message(STATUS "No build type selected, default to Release")
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
 endif()
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 
-option(CLOUDINI_BUILD_TOOLS "Build Tools" ON)
+option(CLOUDINI_BUILD_TOOLS "Build Tools" ${CLOUDINI_IS_TOP_LEVEL})
 option(CLOUDINI_FORCE_VENDORED_DEPS "Force vendored dependencies" ON)
+option(CLOUDINI_WITH_PCL "Build the tests, tools and benchmarks of the (header-only) PCL conversions when PCL is found" ${CLOUDINI_IS_TOP_LEVEL})
+option(CLOUDINI_INSTALL "Generate install rules" ${CLOUDINI_IS_TOP_LEVEL})
+option(CLOUDINI_WASM_SIMD "WebAssembly: use WASM SIMD (the SSE4.1 code paths, translated by Emscripten)" ON)
+
+# Every target, including LZ4 and ZSTD. Engines without WASM SIMD (Safari before 16.4) cannot load the module:
+# build with -DCLOUDINI_WASM_SIMD=OFF for them.
+if(EMSCRIPTEN AND CLOUDINI_WASM_SIMD)
+  add_compile_options(-msimd128 -msse4.1)
+endif()
 
 
 # create compile_commands.json
@@ -22,7 +52,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # add cmake folder to path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
-find_package(ament_cmake QUIET)
+if(CLOUDINI_IS_TOP_LEVEL)
+  find_package(ament_cmake QUIET)
+else()
+  # A ROS parent has found ament_cmake already; embedded, we are not a package.
+  set(ament_cmake_FOUND FALSE)
+endif()
 if(ament_cmake_FOUND)
   message(STATUS "Found ament_cmake")
   set(CLOUDINI_FORCE_VENDORED_DEPS OFF)
@@ -41,18 +76,21 @@ find_or_download_lz4(${CLOUDINI_FORCE_VENDORED_DEPS})
 
 # ----  Trick to pass an absolute path to C++ code  ----
 get_filename_component(DATA_PATH "${CMAKE_CURRENT_LIST_DIR}/samples" ABSOLUTE)
-configure_file (data_path.hpp.in "${CMAKE_BINARY_DIR}/include/data_path.hpp" @ONLY)
+configure_file (data_path.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/include/data_path.hpp" @ONLY)
 add_library(data_path INTERFACE IMPORTED)
-target_include_directories(data_path INTERFACE ${CMAKE_BINARY_DIR}/include)
+target_include_directories(data_path INTERFACE ${CMAKE_CURRENT_BINARY_DIR}/include)
 
 ##################################################################################
 
-find_package(PCL COMPONENTS common io QUIET)
+if(CLOUDINI_WITH_PCL)
+  find_package(PCL COMPONENTS common io QUIET)
+endif()
 
+# The PCL conversions (cloudini_lib/pcl_conversion.hpp) are header-only, so the
+# library itself does not depend on PCL: only its tests, tools and benchmarks.
 if(PCL_FOUND)
   message(STATUS "PCL found in system")
   add_definitions(${PCL_DEFINITIONS})
-  set(PCL_SRC src/pcl_conversion.cpp)
 else()
   message(STATUS "PCL NOT found")
 endif()
@@ -68,7 +106,7 @@ endif()
 #   endif()
 # endif()
 
-option(CLOUDINI_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(CLOUDINI_BUILD_BENCHMARKS "Build benchmarks" ${CLOUDINI_IS_TOP_LEVEL})
 
 # Use SHARED library when building with ament, STATIC otherwise
 SET(CLOUDINI_SRC
@@ -80,26 +118,32 @@ SET(CLOUDINI_SRC
   src/ros_msg_utils.cpp
   src/v4_codec.cpp
   src/v5_codec.cpp
+  src/v6_codec.cpp
 )
 
 if(ament_cmake_FOUND)
   # ROS/ament always builds shared so the plugin pluginlib can dlopen it.
   add_library(cloudini_lib SHARED
     ${CLOUDINI_SRC}
-    ${PCL_SRC}
   )
 else()
   # Standalone builds honor BUILD_SHARED_LIBS (static by default).
   add_library(cloudini_lib
     ${CLOUDINI_SRC}
-    ${PCL_SRC}
   )
 endif()
+
+# Same name as the installed (non-ament) target, so consumers link
+# cloudini::cloudini_lib whether Cloudini is installed or embedded.
+add_library(cloudini::cloudini_lib ALIAS cloudini_lib)
 
 target_compile_features(cloudini_lib PUBLIC cxx_std_20)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   target_compile_options(cloudini_lib PRIVATE -Wall -Wextra)
+  # The codec runs much faster with -O3 than with the -O2 of RelWithDebInfo
+  # (the default of ROS/colcon builds) or of distribution packages:
+  target_compile_options(cloudini_lib PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O3>)
 endif()
 
 target_include_directories(cloudini_lib
@@ -108,21 +152,34 @@ target_include_directories(cloudini_lib
     $<INSTALL_INTERFACE:include>
 )
 
-# In ament/ROS builds cloudini_lib is a shared library. System libzstd.a is not
-# compiled with -fPIC and cannot be embedded in a .so; use the shared variant.
-if(ament_cmake_FOUND AND TARGET zstd::libzstd_shared)
+# When cloudini_lib is a shared library (ROS/ament, or a standalone build with
+# BUILD_SHARED_LIBS=ON such as the conda package), prefer the *shared* variants
+# of zstd/lz4 when available: a non-PIC system libzstd.a / liblz4.a cannot be
+# embedded into a .so. Vendored builds only expose the *_static targets, which
+# are used as the fallback.
+get_target_property(_cloudini_lib_type cloudini_lib TYPE)
+if(_cloudini_lib_type STREQUAL "SHARED_LIBRARY" AND TARGET zstd::libzstd_shared)
   set(CLOUDINI_ZSTD_TARGET zstd::libzstd_shared)
 else()
   set(CLOUDINI_ZSTD_TARGET zstd::libzstd_static)
 endif()
+if(_cloudini_lib_type STREQUAL "SHARED_LIBRARY" AND TARGET LZ4::lz4_shared)
+  set(CLOUDINI_LZ4_TARGET LZ4::lz4_shared)
+else()
+  set(CLOUDINI_LZ4_TARGET LZ4::lz4_static)
+endif()
+
+# PointcloudEncoder uses std::thread. PUBLIC: a static cloudini_lib leaves the
+# pthread references for whoever links the final binary.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 
 target_link_libraries(cloudini_lib
   PRIVATE
-    $<BUILD_INTERFACE:LZ4::lz4_static>
+    $<BUILD_INTERFACE:${CLOUDINI_LZ4_TARGET}>
     $<BUILD_INTERFACE:${CLOUDINI_ZSTD_TARGET}>
   PUBLIC
-    ${PCL_COMMON_LIBRARIES}
-    ${PCL_IO_LIBRARIES}
+    Threads::Threads
 )
 
 if(NOT EMSCRIPTEN)
@@ -137,10 +194,12 @@ if(NOT EMSCRIPTEN)
     add_subdirectory(benchmarks)
   endif()
 
-  include(CTest)
-  message( STATUS "BUILD_TESTING:   ${BUILD_TESTING} " )
-  if (BUILD_TESTING)
-    add_subdirectory(test)
+  if(CLOUDINI_IS_TOP_LEVEL)  # include(CTest) would define BUILD_TESTING in the parent's cache
+    include(CTest)
+    message( STATUS "BUILD_TESTING:   ${BUILD_TESTING} " )
+    if (BUILD_TESTING)
+      add_subdirectory(test)
+    endif()
   endif()
 
 else()
@@ -175,13 +234,14 @@ else()
     LINK_FLAGS "-s DISABLE_EXCEPTION_CATCHING -s ASSERTIONS -s EXPORTED_FUNCTIONS=[${CLD_EXPORTED_FUNCTIONS_STR}] -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','HEAP8','UTF8ToString'] -s MODULARIZE=1 -s EXPORT_NAME='CloudiniModule' -s INITIAL_MEMORY=67108864 -s MAXIMUM_MEMORY=134217728 -s ALLOW_MEMORY_GROWTH=1 -s TOTAL_STACK=1048576"
   )
 
-  # WASM module target used for Foxglove Studio (single file)
+  # WASM module target used for Foxglove Studio (single file). Web and worker only: with Emscripten 7.0.0 the
+  # Node.js branch does require("node:fs"), which the webpack build of the extension cannot resolve.
   add_executable(cloudini_wasm_single src/wasm_functions.cpp)
   target_compile_features(cloudini_wasm_single PRIVATE cxx_std_20)
   target_include_directories(cloudini_wasm_single PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(cloudini_wasm_single PRIVATE cloudini_lib)
   set_target_properties(cloudini_wasm_single PROPERTIES
-    LINK_FLAGS "-s SINGLE_FILE=1 -s NO_DISABLE_EXCEPTION_CATCHING -s ASSERTIONS -s EXPORTED_FUNCTIONS=[${CLD_EXPORTED_FUNCTIONS_STR}] -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','HEAP8','UTF8ToString'] -s MODULARIZE=1 -s EXPORT_NAME='CloudiniModule' -s INITIAL_MEMORY=67108864 -s MAXIMUM_MEMORY=134217728 -s ALLOW_MEMORY_GROWTH=1 -s TOTAL_STACK=1048576"
+    LINK_FLAGS "-s SINGLE_FILE=1 -s ENVIRONMENT=web,worker -s NO_DISABLE_EXCEPTION_CATCHING -s ASSERTIONS -s EXPORTED_FUNCTIONS=[${CLD_EXPORTED_FUNCTIONS_STR}] -s EXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','HEAP8','UTF8ToString'] -s MODULARIZE=1 -s EXPORT_NAME='CloudiniModule' -s INITIAL_MEMORY=67108864 -s MAXIMUM_MEMORY=134217728 -s ALLOW_MEMORY_GROWTH=1 -s TOTAL_STACK=1048576"
   )
 endif(NOT EMSCRIPTEN)
 
@@ -195,20 +255,67 @@ if(CLOUDINI_BUILD_TOOLS AND NOT ament_cmake_FOUND)
   endif()
 endif()
 
-INSTALL(TARGETS cloudini_lib
-        EXPORT cloudini_libTargets
-        ARCHIVE DESTINATION lib
-        LIBRARY DESTINATION lib
-        RUNTIME DESTINATION bin
-        INCLUDES DESTINATION include
-  )
+if(CLOUDINI_INSTALL)
+  INSTALL(TARGETS cloudini_lib
+          EXPORT cloudini_libTargets
+          ARCHIVE DESTINATION lib
+          LIBRARY DESTINATION lib
+          RUNTIME DESTINATION bin
+          INCLUDES DESTINATION include
+    )
 
-INSTALL( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    DESTINATION include
-    FILES_MATCHING PATTERN "*.h*")
+  INSTALL( DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
+      DESTINATION include
+      FILES_MATCHING PATTERN "*.h*")
 
-if(ament_cmake_FOUND)
-  ament_export_targets(cloudini_libTargets HAS_LIBRARY_TARGET)
-  ament_export_dependencies(PCL)
-  ament_package()
+  if(ament_cmake_FOUND)
+    ament_export_targets(cloudini_libTargets HAS_LIBRARY_TARGET)
+    ament_export_dependencies(Threads)
+    ament_package()
+  else()
+    # Standalone (non-ament) install: generate a CMake package config so downstream
+    # projects can do find_package(cloudini_lib) and link cloudini::cloudini_lib.
+    # Static archives retain compressor references: ship vendored archives or
+    # rediscover system libraries in the installed package config.
+    include(CMakePackageConfigHelpers)
+
+    set(CLOUDINI_SYSTEM_LIBRARIES "")
+    if(_cloudini_lib_type STREQUAL "STATIC_LIBRARY")
+      foreach(_dependency IN ITEMS lz4 zstd)
+        set(_vendored_target "${_dependency}_static")
+        if(_dependency STREQUAL "zstd")
+          set(_vendored_target libzstd_static)
+        endif()
+        if(TARGET ${_vendored_target})
+          set_target_properties(${_vendored_target} PROPERTIES OUTPUT_NAME cloudini_${_dependency})
+          install(TARGETS ${_vendored_target} EXPORT cloudini_libTargets ARCHIVE DESTINATION lib)
+          target_link_libraries(cloudini_lib INTERFACE
+            $<INSTALL_INTERFACE:$<LINK_ONLY:cloudini::${_vendored_target}>>)
+        else()
+          list(APPEND CLOUDINI_SYSTEM_LIBRARIES ${_dependency})
+        endif()
+      endforeach()
+    endif()
+
+    install(EXPORT cloudini_libTargets
+      FILE cloudini_libTargets.cmake
+      NAMESPACE cloudini::
+      DESTINATION lib/cmake/cloudini_lib)
+
+
+    configure_package_config_file(
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cloudini_libConfig.cmake.in
+      ${CMAKE_CURRENT_BINARY_DIR}/cloudini_libConfig.cmake
+      INSTALL_DESTINATION lib/cmake/cloudini_lib)
+
+    write_basic_package_version_file(
+      ${CMAKE_CURRENT_BINARY_DIR}/cloudini_libConfigVersion.cmake
+      VERSION ${PROJECT_VERSION}
+      COMPATIBILITY SameMajorVersion)
+
+    install(FILES
+      ${CMAKE_CURRENT_BINARY_DIR}/cloudini_libConfig.cmake
+      ${CMAKE_CURRENT_BINARY_DIR}/cloudini_libConfigVersion.cmake
+      DESTINATION lib/cmake/cloudini_lib)
+  endif()
 endif()

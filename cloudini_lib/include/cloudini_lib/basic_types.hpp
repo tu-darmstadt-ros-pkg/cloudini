@@ -17,9 +17,11 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Cloudini {
@@ -66,15 +68,38 @@ struct PointField {
   }
 };
 
-/**
- * @brief True if the field holds a color packed into the bit pattern of a FLOAT32.
- *
- * ROS and PCL store colors in a FLOAT32 field named "rgb" (or "rgba") whose bits are a packed
- * 0x00RRGGBB / 0xAARRGGBB integer rather than a real number. Quantizing such a field with a
- * resolution collapses it to zero, so it must never be assigned one.
- */
-inline bool isPackedColorField(const PointField& field) {
-  return field.type == FieldType::FLOAT32 && (field.name == "rgb" || field.name == "rgba");
+// Returns true if the field name denotes a color packed as integer bits (e.g. "rgb", "rgba").
+// Many ROS drivers store packed RGB(A) as uint32 bits reinterpreted into a FLOAT32 field;
+// such fields must never be quantized (lossy), otherwise the colors are destroyed.
+// The match is case-insensitive.
+inline bool isPackedColorField(std::string_view name) {
+  constexpr std::string_view kNames[] = {"rgb", "rgba", "bgr", "bgra", "argb", "abgr"};
+  for (const auto& candidate : kNames) {
+    if (name.size() != candidate.size()) {
+      continue;
+    }
+    bool equal = true;
+    for (size_t i = 0; i < name.size() && equal; ++i) {
+      char c = name[i];
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+      equal = (c == candidate[i]);
+    }
+    if (equal) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Default resolution to use for a field when the user did not explicitly specify one:
+// FLOAT32 fields get `default_resolution`, except packed colors, which stay lossless.
+inline std::optional<float> defaultFieldResolution(const PointField& field, std::optional<float> default_resolution) {
+  if (field.type == FieldType::FLOAT32 && !isPackedColorField(field.name)) {
+    return default_resolution;
+  }
+  return std::nullopt;
 }
 
 // If the value of PointField::offset is equal to this one, it means that the field was encoded, but we don't want to

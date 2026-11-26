@@ -14,15 +14,20 @@
  * limitations under the License.
  */
 
-#include "cloudini_lib/pcl_conversion.hpp"
+// Implementation of pcl_conversion.hpp, header-only so that cloudini_lib itself
+// does not depend on PCL: only the code using these functions does.
+#pragma once
 
 #include <pcl/io/pcd_io.h>
 
+#include <map>
 #include <sstream>
+#include <string_view>
 
 namespace Cloudini {
 
-std::vector<std::string_view> splitString(std::string_view str, char delimiter = ' ') {
+namespace detail {
+inline std::vector<std::string_view> splitString(std::string_view str, char delimiter = ' ') {
   std::vector<std::string_view> tokens;
   std::string_view::size_type start = 0;
   std::string_view::size_type end = 0;
@@ -34,9 +39,10 @@ std::vector<std::string_view> splitString(std::string_view str, char delimiter =
   tokens.push_back(str.substr(start));
   return tokens;
 }
+}  // namespace detail
 
 // https://pointclouds.org/documentation/tutorials/pcd_file_format.html
-std::map<std::string, FieldType> ReadEncodingInfoFromPCD(std::istream& stream) {
+inline std::map<std::string, FieldType> ReadEncodingInfoFromPCD(std::istream& stream) {
   std::string line;
   std::vector<std::string> fields_name;
   std::vector<std::string> fields_size;
@@ -48,7 +54,7 @@ std::map<std::string, FieldType> ReadEncodingInfoFromPCD(std::istream& stream) {
     line = line.substr(0, line.find('\r'));  // Remove carriage return if present
     line = line.substr(0, line.find('\n'));  // Remove newline if present
 
-    auto split_line = splitString(line);
+    auto split_line = detail::splitString(line);
     if (split_line.empty()) {
       continue;
     }
@@ -106,7 +112,7 @@ std::map<std::string, FieldType> ReadEncodingInfoFromPCD(std::istream& stream) {
   return types_map;
 }
 
-bool isSameEncodingInfo(const EncodingInfo& info1, const EncodingInfo& info2) {
+inline bool isSameEncodingInfo(const EncodingInfo& info1, const EncodingInfo& info2) {
   if (info1.fields.size() != info2.fields.size()) {
     return false;
   }
@@ -124,7 +130,7 @@ bool isSameEncodingInfo(const EncodingInfo& info1, const EncodingInfo& info2) {
          info1.point_step == info2.point_step;
 }
 
-EncodingInfo ConvertToEncodingInfo(const pcl::PCLPointCloud2& cloud, double resolution_XYZ) {
+inline EncodingInfo ConvertToEncodingInfo(const pcl::PCLPointCloud2& cloud, double resolution_XYZ) {
   EncodingInfo info;
 
   info.width = cloud.width;
@@ -167,12 +173,10 @@ EncodingInfo ConvertToEncodingInfo(const pcl::PCLPointCloud2& cloud, double reso
         break;
     }
 
-    // If the field is a FLOAT32 and has a resolution, set it.
-    // Packed color fields are excluded: their bits are an integer, not a real value.
-    if (point_field.type == FieldType::FLOAT32 && resolution_XYZ > 0.0 && !isPackedColorField(point_field)) {
-      point_field.resolution = resolution_XYZ;
-    } else {
-      point_field.resolution = std::nullopt;
+    // If the field is a FLOAT32 (but not a packed color like "rgb") and has a resolution, set it
+    point_field.resolution = std::nullopt;
+    if (resolution_XYZ > 0.0) {
+      point_field.resolution = defaultFieldResolution(point_field, static_cast<float>(resolution_XYZ));
     }
 
     info.fields.push_back(point_field);
@@ -181,7 +185,7 @@ EncodingInfo ConvertToEncodingInfo(const pcl::PCLPointCloud2& cloud, double reso
 }
 
 template <>
-EncodingInfo ConvertToEncodingInfo<pcl::PointXYZ>(const pcl::PointCloud<pcl::PointXYZ>& cloud, double resolution_XYZ) {
+inline EncodingInfo ConvertToEncodingInfo<pcl::PointXYZ>(const pcl::PointCloud<pcl::PointXYZ>& cloud, double resolution_XYZ) {
   EncodingInfo info;
   info.width = cloud.width;
   info.height = cloud.height;
@@ -193,7 +197,7 @@ EncodingInfo ConvertToEncodingInfo<pcl::PointXYZ>(const pcl::PointCloud<pcl::Poi
 }
 
 template <>
-EncodingInfo ConvertToEncodingInfo<pcl::PointXYZI>(
+inline EncodingInfo ConvertToEncodingInfo<pcl::PointXYZI>(
     const pcl::PointCloud<pcl::PointXYZI>& cloud, double resolution_XYZ) {
   EncodingInfo info;
   info.width = cloud.width;
@@ -210,16 +214,17 @@ EncodingInfo ConvertToEncodingInfo<pcl::PointXYZI>(
   return info;
 }
 
-size_t PCLPointCloudEncode(
+inline size_t PCLPointCloudEncode(
     const pcl::PCLPointCloud2& cloud, std::vector<uint8_t>& serialized_cloud, double resolution_XYZ) {
   // get the encoding info
   EncodingInfo info = ConvertToEncodingInfo(cloud, resolution_XYZ);
-  PointcloudEncoder encoder(info);
   ConstBufferView data_view(cloud.data.data(), cloud.data.size());
+  RefineResolutionsToData(info, data_view);
+  PointcloudEncoder encoder(info);
   return encoder.encode(data_view, serialized_cloud);
 }
 
-size_t PCLPointCloudEncode(
+inline size_t PCLPointCloudEncode(
     const std::filesystem::path& input_pcd_file, std::vector<uint8_t>& serialized_cloud, double resolution_XYZ) {
   pcl::PCLPointCloud2 cloud;
   if (pcl::io::loadPCDFile(input_pcd_file.string(), cloud) == -1) {
@@ -235,12 +240,13 @@ size_t PCLPointCloudEncode(
       field.type = pcd_fields_map.at(field.name);
     }
   }
-  PointcloudEncoder encoder(info);
   ConstBufferView data_view(cloud.data.data(), cloud.data.size());
+  RefineResolutionsToData(info, data_view);
+  PointcloudEncoder encoder(info);
   return encoder.encode(data_view, serialized_cloud);
 }
 
-void PCLPointCloudDecode(ConstBufferView serialized_data, pcl::PCLPointCloud2& cloud) {
+inline void PCLPointCloudDecode(ConstBufferView serialized_data, pcl::PCLPointCloud2& cloud) {
   // decode the header
   EncodingInfo header_info = DecodeHeader(serialized_data);
 

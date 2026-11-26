@@ -1,10 +1,31 @@
 function(find_or_download_zstd FORCE_VENDORED)
 
   if(NOT FORCE_VENDORED)
-    find_package(zstd CONFIG QUIET)
-    if(NOT TARGET zstd::libzstd_static)
-      find_package(ZSTD QUIET)
+    # A parent project may have defined (some of) these targets already, e.g. from
+    # a Find module. Looking zstd up again would then fail with "some (but not all)
+    # targets in this export set were already defined": reuse what is there.
+    if(NOT TARGET zstd::libzstd_static AND NOT TARGET zstd::libzstd_shared AND NOT TARGET zstd::libzstd)
+      find_package(zstd CONFIG QUIET)
+      if(NOT TARGET zstd::libzstd_static)
+        find_package(ZSTD QUIET)
+      endif()
     endif()
+
+    # Normalize target names. This project links zstd::libzstd_static, but some
+    # packagings expose only zstd::libzstd_shared / zstd::libzstd (notably
+    # conda-forge, which ships no static zstd). Alias whatever was found to the
+    # expected name so we use the system library instead of vendoring a copy.
+    if(NOT TARGET zstd::libzstd_static)
+      foreach(_zstd_found zstd::libzstd_shared zstd::libzstd)
+        if(TARGET ${_zstd_found})
+          add_library(zstd::libzstd_static INTERFACE IMPORTED)
+          set_target_properties(zstd::libzstd_static PROPERTIES
+            INTERFACE_LINK_LIBRARIES ${_zstd_found})
+          break()
+        endif()
+      endforeach()
+    endif()
+
     if(TARGET zstd::libzstd_static)
       return()
     endif()
@@ -32,7 +53,7 @@ function(find_or_download_zstd FORCE_VENDORED)
     # define a helper to build both static and shared variants
     add_library(libzstd_static STATIC ${CommonSources} ${CompressSources} ${DecompressSources})
     set_property(TARGET libzstd_static PROPERTY POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(libzstd_static PUBLIC ${zstd_SOURCE_DIR}/lib)
+    target_include_directories(libzstd_static PUBLIC $<BUILD_INTERFACE:${zstd_SOURCE_DIR}/lib>)
 
     add_library(zstd::libzstd_static INTERFACE IMPORTED)
     set_target_properties(zstd::libzstd_static PROPERTIES

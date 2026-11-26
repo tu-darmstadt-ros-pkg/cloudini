@@ -171,6 +171,8 @@ using ResolutionProfile = std::map<std::string, float>;
  * @param profile The resolution profile to apply.
  * @param field The fields to apply the profile to.
  * @param default_resolution Optional default resolution to apply to FLOAT32 fields not in the profile.
+ *        Packed color fields ("rgb", "rgba", ...; see Cloudini::isPackedColorField) are skipped
+ *        and stay lossless, unless the profile names them explicitly.
  */
 void applyResolutionProfile(
     const ResolutionProfile& profile, std::vector<Cloudini::PointField>& field,
@@ -187,10 +189,13 @@ void writePointCloudHeader(nanocdr::Encoder& encoder, const RosPointCloud2& pc_i
 RosPointCloud2 getDeserializedPointCloudMessage(Cloudini::ConstBufferView pc2_dds_msg);
 
 // Given as input a raw DDS message, containing a sensor_msgs/msg/PointCloud2,
-// apply compression and write the result into a point_cloud_interfaces/msg/CompressedPointCloud2
+// apply compression and write the result into a point_cloud_interfaces/msg/CompressedPointCloud2.
+// With `encoder_cache`, the encoder is reused across the messages of a stream (see PointcloudEncoderCache).
+// The resolutions are first refined to the data (RefineResolutionsToData) unless `refine_resolutions` is false.
 void convertPointCloud2ToCompressedCloud(
     const RosPointCloud2& pc_info, const Cloudini::EncodingInfo& encoding_info,
-    std::vector<uint8_t>& compressed_dds_msg);
+    std::vector<uint8_t>& compressed_dds_msg, Cloudini::PointcloudEncoderCache* encoder_cache = nullptr,
+    bool refine_resolutions = true);
 
 // Assumining that pc_info contains compressed data, decompress it directly into raw_dds_msg
 void convertCompressedCloudToPointCloud2(const RosPointCloud2& pc_info, std::vector<uint8_t>& pc2_dds_msg);

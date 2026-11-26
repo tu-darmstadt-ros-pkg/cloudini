@@ -39,7 +39,36 @@ class FieldDecoder {
    */
   virtual void decode(ConstBufferView& input, BufferView dest_point_view) = 0;
 
+  /**
+   * @brief Decode `count` consecutive points, when this is the only per-point decoder of the chunk.
+   * Same result as calling decode() once per point; derived classes may override it with a faster loop.
+   *
+   * @param input The encoded data. Advanced past the decoded points.
+   * @param output The first point to write. Must have room for `count * point_step` bytes.
+   */
+  virtual void decodePoints(ConstBufferView& input, uint8_t* output, size_t point_step, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      if (input.size() < min_input_bytes_) {
+        throw std::runtime_error("Truncated encoded data: not enough bytes for a complete point");
+      }
+      decode(input, BufferView(output + i * point_step, point_step));
+    }
+  }
+
   virtual void reset() = 0;
+
+  /// Largest number of input bytes one decode() can consume, or 0 when unbounded (no fast path).
+  virtual size_t maxInputBytes() const {
+    return 0;
+  }
+
+  /**
+   * @brief Same result as decode(), for a caller that guarantees at least maxInputBytes() readable bytes
+   * at `ptr` (so no per-byte bounds checks). Advances `ptr`. Only valid when maxInputBytes() != 0.
+   */
+  virtual void decodeUnchecked(const uint8_t*& /*ptr*/, uint8_t* /*point*/) {
+    throw std::logic_error("FieldDecoder::decodeUnchecked: override it together with maxInputBytes()");
+  }
 
   /// Minimum number of input bytes this decoder needs per call.
   /// Used by PointcloudDecoder for a single per-point bounds check.
@@ -60,16 +89,72 @@ class FieldDecoderCopy : public FieldDecoder {
   }
 
   void decode(ConstBufferView& input, BufferView dest_point_view) override {
-    // Bounds validated by PointcloudDecoder's per-point check + trim_front's own check
-    if (offset_ != kDecodeButSkipStore) {
-      memcpy(dest_point_view.data() + offset_, input.data(), field_size_);
+    // The per-point check only guarantees the sum of the minimum sizes: the fields decoded before this
+    // one may have used more, so check before reading.
+    if (input.size() < field_size_) {
+      throw std::runtime_error("FieldDecoderCopy::decode: truncated input");
     }
+    const uint8_t* ptr = input.data();
+    FieldDecoderCopy::decodeUnchecked(ptr, dest_point_view.data());
     input.trim_front(field_size_);
+  }
+
+  // Same result as decode() once per point, as one copy when the values are contiguous (a single-field
+  // cloud), or a strided one with a compile-time size otherwise.
+  void decodePoints(ConstBufferView& input, uint8_t* output, size_t point_step, size_t count) override {
+    if (input.size() / field_size_ < count) {
+      throw std::runtime_error("Truncated encoded data: not enough bytes for a complete point");
+    }
+    if (offset_ != kDecodeButSkipStore) {
+      const uint8_t* src = input.data();
+      uint8_t* dst = output + offset_;
+      if (point_step == field_size_) {
+        memcpy(dst, src, count * field_size_);
+      } else {
+        switch (field_size_) {
+          case 1:
+            copyStrided<1>(src, dst, point_step, count);
+            break;
+          case 2:
+            copyStrided<2>(src, dst, point_step, count);
+            break;
+          case 4:
+            copyStrided<4>(src, dst, point_step, count);
+            break;
+          case 8:
+            copyStrided<8>(src, dst, point_step, count);
+            break;
+          default:
+            for (size_t i = 0; i < count; ++i) {
+              memcpy(dst + i * point_step, src + i * field_size_, field_size_);
+            }
+        }
+      }
+    }
+    input.trim_front(count * field_size_);
   }
 
   void reset() override {}
 
+  size_t maxInputBytes() const override {
+    return field_size_;
+  }
+
+  void decodeUnchecked(const uint8_t*& ptr, uint8_t* point) override {
+    if (offset_ != kDecodeButSkipStore) {
+      memcpy(point + offset_, ptr, field_size_);
+    }
+    ptr += field_size_;
+  }
+
  private:
+  template <size_t N>
+  static void copyStrided(const uint8_t* src, uint8_t* dst, size_t point_step, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      memcpy(dst + i * point_step, src + i * N, N);
+    }
+  }
+
   size_t offset_ = 0;
   size_t field_size_ = 0;
 };
@@ -88,7 +173,8 @@ class FieldDecoderInt : public FieldDecoder {
     int64_t diff = 0;
     auto count = decodeVarint(input.data(), input.size(), diff);
 
-    int64_t value = prev_value_ + diff;
+    // wrap-around addition: a corrupted delta must not overflow a signed integer
+    const int64_t value = static_cast<int64_t>(static_cast<uint64_t>(prev_value_) + static_cast<uint64_t>(diff));
     prev_value_ = value;
     if (offset_ != kDecodeButSkipStore) {
       memcpy(dest_point_view.data() + offset_, &value, sizeof(IntType));
@@ -98,6 +184,20 @@ class FieldDecoderInt : public FieldDecoder {
 
   void reset() override {
     prev_value_ = 0;
+  }
+
+  size_t maxInputBytes() const override {
+    return kMaxVarintBytes;
+  }
+
+  void decodeUnchecked(const uint8_t*& ptr, uint8_t* point) override {
+    int64_t diff = 0;
+    ptr += decodeVarintUnchecked(ptr, diff);
+    const int64_t value = static_cast<int64_t>(static_cast<uint64_t>(prev_value_) + static_cast<uint64_t>(diff));
+    prev_value_ = value;
+    if (offset_ != kDecodeButSkipStore) {
+      memcpy(point + offset_, &value, sizeof(IntType));
+    }
   }
 
  private:
@@ -119,8 +219,41 @@ class FieldDecoderFloat_Lossy : public FieldDecoder {
 
   void decode(ConstBufferView& input, BufferView dest_point_view) override;
 
+  // Same result as decode() once per point, without per-byte bounds checks while a longest varint fits.
+  void decodePoints(ConstBufferView& input, uint8_t* output, size_t point_step, size_t count) override {
+    const uint8_t* ptr = input.data();
+    const uint8_t* const end = input.data() + input.size();
+    size_t i = 0;
+    for (; i < count && static_cast<size_t>(end - ptr) >= kMaxVarintBytes; ++i) {
+      FieldDecoderFloat_Lossy::decodeUnchecked(ptr, output + i * point_step);
+    }
+    input.trim_front(static_cast<size_t>(ptr - input.data()));
+    FieldDecoder::decodePoints(input, output + i * point_step, point_step, count - i);
+  }
+
   void reset() override {
     prev_value_ = 0;
+  }
+
+  size_t maxInputBytes() const override {
+    return kMaxVarintBytes;
+  }
+
+  void decodeUnchecked(const uint8_t*& ptr, uint8_t* point) override {
+    FloatType value;
+    if (*ptr == 0) {
+      ++ptr;
+      prev_value_ = 0;
+      value = std::numeric_limits<FloatType>::quiet_NaN();
+    } else {
+      int64_t diff = 0;
+      ptr += decodeVarintUnchecked(ptr, diff);
+      prev_value_ = static_cast<int64_t>(static_cast<uint64_t>(prev_value_) + static_cast<uint64_t>(diff));
+      value = static_cast<FloatType>(prev_value_) * multiplier_;
+    }
+    if (offset_ != kDecodeButSkipStore) {
+      memcpy(point + offset_, &value, sizeof(FloatType));
+    }
   }
 
  private:
@@ -143,6 +276,21 @@ class FieldDecoderFloat_XOR : public FieldDecoder {
 
   void reset() override {
     prev_bits_ = 0;
+  }
+
+  size_t maxInputBytes() const override {
+    return sizeof(IntType);
+  }
+
+  void decodeUnchecked(const uint8_t*& ptr, uint8_t* point) override {
+    IntType residual = 0;
+    memcpy(&residual, ptr, sizeof(IntType));
+    ptr += sizeof(IntType);
+    const IntType current_bits = residual ^ prev_bits_;
+    prev_bits_ = current_bits;
+    if (offset_ != kDecodeButSkipStore) {
+      memcpy(point + offset_, &current_bits, sizeof(FloatType));
+    }
   }
 
  private:
@@ -270,7 +418,10 @@ inline void FieldDecoderFloat_Gorilla<FloatType>::decode(ConstBufferView& input,
       const uint64_t control = getBits(1, input);
       IntType xor_val;
       if (control == 0) {
-        // Reuse previous window.
+        // Reuse previous window. The encoder writes a new window first.
+        if (prev_leading_ == kLeadingSentinel) {
+          throw std::runtime_error("FieldDecoderFloat_Gorilla: window reused before it is set");
+        }
         const uint8_t meaningful = static_cast<uint8_t>(kTypeBits - prev_leading_ - prev_trailing_);
         const uint64_t bits = getBits(meaningful, input);
         xor_val = static_cast<IntType>(bits << prev_trailing_);
@@ -278,6 +429,9 @@ inline void FieldDecoderFloat_Gorilla<FloatType>::decode(ConstBufferView& input,
         // New window: read leading(5), meaningful-1(6), meaningful bits.
         const uint8_t stored_leading = static_cast<uint8_t>(getBits(5, input));
         const uint8_t meaningful = static_cast<uint8_t>(getBits(6, input) + 1);
+        if (stored_leading + meaningful > kTypeBits) {
+          throw std::runtime_error("FieldDecoderFloat_Gorilla: window larger than the value");
+        }
         const uint64_t bits = getBits(meaningful, input);
         const uint8_t trailing = static_cast<uint8_t>(kTypeBits - stored_leading - meaningful);
         xor_val = static_cast<IntType>(bits << trailing);
@@ -314,11 +468,22 @@ class FieldDecoderFloatN_Lossy : public FieldDecoder {
 
   void decode(ConstBufferView& input, BufferView dest_point_view) override;
 
+  void decodePoints(ConstBufferView& input, uint8_t* output, size_t point_step, size_t count) override;
+
   void reset() override {
     prev_vect_ = Vector4i(0, 0, 0, 0);
   }
 
+  size_t maxInputBytes() const override {
+    return fields_count_ * kMaxVarintBytes;
+  }
+
+  void decodeUnchecked(const uint8_t*& ptr, uint8_t* point) override;
+
  private:
+  template <size_t N>
+  void decodePointsImpl(ConstBufferView& input, uint8_t* output, size_t point_step, size_t count);
+
   std::array<size_t, 4> offset_ = {0, 0, 0, 0};
   size_t fields_count_ = 0;
 
@@ -329,7 +494,10 @@ class FieldDecoderFloatN_Lossy : public FieldDecoder {
 //------------------------------------------------------------------------------------------
 template <typename FloatType>
 inline void FieldDecoderFloat_Lossy<FloatType>::decode(ConstBufferView& input, BufferView dest_point_view) {
-  // Bounds validated by PointcloudDecoder's per-point min_encoded_point_bytes_ check
+  // checked here: the per-point check only guarantees the sum of the minimum sizes
+  if (input.empty()) {
+    throw std::runtime_error("FieldDecoderFloat_Lossy::decode: truncated input");
+  }
   if (input.data()[0] == 0) {
     constexpr auto nan_value = std::numeric_limits<FloatType>::quiet_NaN();
     if (offset_ != kDecodeButSkipStore) {
@@ -342,7 +510,8 @@ inline void FieldDecoderFloat_Lossy<FloatType>::decode(ConstBufferView& input, B
 
   int64_t diff = 0;
   const auto count = decodeVarint(input.data(), input.size(), diff);
-  const int64_t value = prev_value_ + diff;
+  // wrap-around addition: a corrupted delta must not overflow a signed integer
+  const int64_t value = static_cast<int64_t>(static_cast<uint64_t>(prev_value_) + static_cast<uint64_t>(diff));
   const FloatType value_real = static_cast<FloatType>(value) * multiplier_;
   prev_value_ = value;
 
@@ -354,18 +523,12 @@ inline void FieldDecoderFloat_Lossy<FloatType>::decode(ConstBufferView& input, B
 
 template <typename FloatType>
 inline void FieldDecoderFloat_XOR<FloatType>::decode(ConstBufferView& input, BufferView dest_point_view) {
-  // Bounds validated by PointcloudDecoder's per-point check + trim_front's own check
-  IntType residual = 0;
-  memcpy(&residual, input.data(), sizeof(IntType));
-  input.trim_front(sizeof(IntType));
-
-  // XOR the residual with the previous bits to recover the current value
-  const IntType current_bits = residual ^ prev_bits_;
-  prev_bits_ = current_bits;
-
-  // Convert back to float and store in destination
-  if (offset_ != kDecodeButSkipStore) {
-    memcpy(dest_point_view.data() + offset_, &current_bits, sizeof(FloatType));
+  // checked here: the per-point check only guarantees the sum of the minimum sizes
+  if (input.size() < sizeof(IntType)) {
+    throw std::runtime_error("FieldDecoderFloat_XOR::decode: truncated input");
   }
+  const uint8_t* ptr = input.data();
+  FieldDecoderFloat_XOR<FloatType>::decodeUnchecked(ptr, dest_point_view.data());
+  input.trim_front(sizeof(IntType));
 }
 }  // namespace Cloudini
